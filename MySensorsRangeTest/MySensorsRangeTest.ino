@@ -15,7 +15,6 @@
 #define NODE_ID_SLAVE          (101)
 #define SCREEN_UPDATE_COUNT    (10)     // Update screen each xx Ping-pong sequences
 #define MAX_NUM_CONFIG_RETRIES (10)     // Number of transmission attempts when changing config
-#define HISTOGRAM_DECAY_RATE   (0)
 
 #ifdef MASTER
 #define MY_NODE_ID             NODE_ID_MASTER
@@ -37,12 +36,13 @@
 #define MY_PARENT_NODE_IS_STATIC
 #define MY_TRANSPORT_UPLINK_CHECK_DISABLED
 // #undef MY_REGISTRATION_FEATURE in MyConfig.h to speed up startup by 2 seconds
+//#define MY_DEBUG
 
 #define MY_RADIO_NRF24
 //#define MY_RF24_CHANNEL        (112)    
 //#define MY_RF24_BASE_RADIO_ID  0x00,0xFC,0xE1,0xA8,0xA8
 //#define MY_RF24_DATARATE       (RF24_1MBPS)
-//#define MY_RF24_PA_LEVEL       (RF24_PA_MIN)
+#define MY_RF24_PA_LEVEL       (RF24_PA_MIN)    // Start at low level to prevent issues with nodes close to eachother
 //#define MY_RF24_PA_LEVEL       (RF24_PA_LOW)
 //#define MY_RF24_PA_LEVEL       (RF24_PA_HIGH)
 //#define MY_RF24_PA_LEVEL       (RF24_PA_MAX)
@@ -54,11 +54,25 @@
 
 
 #ifdef MY_RADIO_NRF24
-// RSSI range for nRF24
-#define RSSI_MIN   (-149.0)
-#define RSSI_MAX   (-29.0)
-#define RSSI_STEP  (8.0)
+#define RSSI_MIN                   (-149.0)
+#define RSSI_MAX                   (-29.0)
+#define RSSI_STEP                  (8.0)
+#define RADIO_CHANNEL_MIN          (0)
+#define RADIO_CHANNEL_MAX          (125)
+#define RADIO_DATARATE_MIN         (0)
+#define RADIO_DATARATE_MAX         (2)
+#define RADIO_PALEVEL_MIN          (0)
+#define RADIO_PALEVEL_MAX          (3)
+#define RADIO_RETRANSMITS_MIN      (0)
+#define RADIO_RETRANSMITS_MAX      (15)
+#define RADIO_RETRANSMITSDELAY_MIN (0)
+#define RADIO_RETRANSMITSDELAY_MAX (15)
 #endif
+
+#define PAYLOAD_LENGTH_MIN         (1)
+#define PAYLOAD_LENGTH_MAX         (MAX_PAYLOAD)
+#define HISTOGRAM_DECAY_RATE_MIN   (0)
+#define HISTOGRAM_DECAY_RATE_MAX   (10)
 
 //#ifdef MASTER
 //#define MY_INDICATION_HANDLER
@@ -90,11 +104,12 @@ struct t_command
 static t_command cmd;
 
 // Actual data exchanged as ping-pong message 
-// TODO: Allow large data packets as testcase
-struct t_pingPongData
-{
+#pragma pack(push, 1)
+union t_pingPongData {
   uint8_t m_count;
+  uint8_t m_dummy[MAX_PAYLOAD];
 };
+#pragma pack(pop)
 
 // Internal housekeeping data
 struct t_txData
@@ -121,6 +136,8 @@ static t_txData  txData;
 static MyMessage txMsgPingPong;
 static MyMessage txMsgConfig;
 static t_configData& config = *(static_cast<t_configData*>(txMsgConfig.getCustom()));
+static uint8_t histogramDecayRate = 0;
+static size_t    payloadLen = PAYLOAD_LENGTH_MIN;      // Length of ping-pong payload
 
 // First bucket in histogram is used to store transmitssion failures.
 // This looks most intuitive as the results will be displayed next to the lowest RSSI.
@@ -183,16 +200,18 @@ String rightAlignStr(const String str, const size_t width, const char fill = ' '
 
 
 #define ROW_HEADER                (1)
-#define ROW_CONFIG                (2)
+#define ROW_CONFIG                (ROW_HEADER+2)
 #define COL_WIDTH_CONFIG          (15)
-#define ROW_HIST_RSSI             (6)
+#define ROW_HIST_RSSI             (ROW_CONFIG+5)
 #define WIDTH_HIST_RSSI_BUCKETS   (COL_WIDTH_CONFIG)
 #define WIDTH_HIST_RSSI           (3*COL_WIDTH_CONFIG)
 #define WIDTH_HIST_RSSI_COUNTS    (10)
-#define ROW_HIST_TXOK             (24)
+#define ROW_HIST_TXOK             (ROW_HIST_RSSI+18)
 #define WIDTH_HIST_TXOK_BUCKETS   (WIDTH_HIST_RSSI_BUCKETS)
 #define WIDTH_HIST_TXOK           (WIDTH_HIST_RSSI)
 #define WIDTH_HIST_TXOK_COUNTS    (WIDTH_HIST_RSSI_COUNTS)
+#define ROW_MENU                  (ROW_HIST_TXOK+2)
+#define COL_WIDTH_MENU            (30)
 
 void screenUpdate(const bool rebuild)
 {
@@ -215,9 +234,11 @@ void screenUpdate(const bool rebuild)
     Serial << xy(1,ROW_CONFIG+2)                    << F("Retransmits");
     Serial << xy(1+COL_WIDTH_CONFIG,ROW_CONFIG+2)   << boldOn() << rightAlignStr(String(config.m_retransmits), COL_WIDTH_CONFIG-1) << boldOff();
     Serial << xy(1+2*COL_WIDTH_CONFIG,ROW_CONFIG+2) << F("RetrDelay");
-    String strDelay = String( uint16_t(config.m_retransmitDelay)*250 );
+    String strDelay = String( uint16_t(config.m_retransmitDelay + 1)*250 );
     strDelay += F("us");
     Serial << xy(1+3*COL_WIDTH_CONFIG,ROW_CONFIG+2) << boldOn() << rightAlignStr(strDelay, COL_WIDTH_CONFIG-1) << boldOff() ;
+    Serial << xy(1,ROW_CONFIG+3)                    << F("Payload size");
+    Serial << xy(1+COL_WIDTH_CONFIG,ROW_CONFIG+3)   << boldOn() << rightAlignStr(String(payloadLen), COL_WIDTH_CONFIG-1) << boldOff();
   }
 
   // RSSI histogram
@@ -253,7 +274,7 @@ void screenUpdate(const bool rebuild)
     ++y;
   }
   // SLowly decrease bucket values, to limit history time
-  histRssi.decay(HISTOGRAM_DECAY_RATE);
+  histRssi.decay(histogramDecayRate);
 
   // Tx Ok/Fail histogram
   x = WIDTH_HIST_TXOK_BUCKETS+1;
@@ -279,10 +300,110 @@ void screenUpdate(const bool rebuild)
   Serial << xy(WIDTH_HIST_TXOK_BUCKETS+WIDTH_HIST_TXOK+1+1,y) << boldOn() << setForegroundColor(GREEN) << rightAlignStr(ratio, WIDTH_HIST_TXOK_COUNTS) << boldOff();
   Serial << defaultForeground();
   // SLowly decrease bucket values, to limit history time
-  histTxOk.decay(HISTOGRAM_DECAY_RATE);
+  histTxOk.decay(histogramDecayRate);
 
+  // Menu
+  if (rebuild)
+  {
+    Serial << setForegroundColor(BLUE);
+    //                                              000000000011111111112222222222
+    //                                              012345678901234567890123456789
+#ifdef MASTER
+    Serial << xy(1,ROW_MENU)                  << F("cn - Set channel [0..125]");
+    Serial << xy(1+COL_WIDTH_MENU,ROW_MENU)   << F("rn - Set datarate [0..2]");
+    Serial << xy(1,ROW_MENU+1)                << F("pn - Set PaLevel [0..3]");
+    Serial << xy(1+COL_WIDTH_MENU,ROW_MENU+1) << F("tn - Set retransmits [0..15]");
+    Serial << xy(1,ROW_MENU+2)                << F("yn - Set retr. delay [0..15]");
+    Serial << xy(1,ROW_MENU+3)                << F("ln - Set payload len [1..") << MAX_PAYLOAD << ']';
+    Serial << xy(1+COL_WIDTH_MENU,ROW_MENU+3) << F("x - Reset settings");
+#endif
+    Serial << xy(1,ROW_MENU+4)                << F("0 - Reset statistics");
+    Serial << xy(1+COL_WIDTH_MENU,ROW_MENU+4) << F("dn - Set hist. decay [0..5]");
+  }
   Serial << home();
 }
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wtype-limits"
+bool processCommand(t_command& cmd)
+{
+  bool configChanged = false;
+  if (cmd.m_complete)
+  {
+    uint8_t value = uint8_t(cmd.m_text.substring(1, cmd.m_text.length()).toInt());
+    if (cmd.m_text.startsWith(F("0")))
+    {
+      histRssi.clear();
+      histTxOk.clear();
+    }
+    else if (cmd.m_text.startsWith(F("d")))
+    {
+      if ((value >= HISTOGRAM_DECAY_RATE_MIN) && (value <= HISTOGRAM_DECAY_RATE_MAX))
+      {
+        histogramDecayRate = value;
+      }
+    }
+#ifdef MASTER
+    else if (cmd.m_text.startsWith(F("x")))
+    {
+      config.setDefault();
+      configChanged = true;
+    }
+    else if (cmd.m_text.startsWith(F("c")))
+    {
+      if ((value >= RADIO_CHANNEL_MIN) && (value <= RADIO_CHANNEL_MAX))
+      {
+        config.m_channel = value;
+        configChanged = true;
+      }
+    }
+    else if (cmd.m_text.startsWith(F("r")))
+    {
+      if ((value >= RADIO_DATARATE_MIN) && (value <= RADIO_DATARATE_MAX))
+      {
+        config.m_dataRate = value;
+        configChanged = true;
+      }
+    }
+    else if (cmd.m_text.startsWith(F("p")))
+    {
+      if ((value >= RADIO_PALEVEL_MIN) && (value <= RADIO_PALEVEL_MAX))
+      {
+        config.m_paLevel = value;
+        configChanged = true;
+      }
+    }
+    else if (cmd.m_text.startsWith(F("t")))
+    {
+      if ((value >= RADIO_RETRANSMITS_MIN) && (value <= RADIO_RETRANSMITS_MAX))
+      {
+        config.m_retransmits = value;
+        configChanged = true;
+      }
+    }
+    else if (cmd.m_text.startsWith(F("y")))
+    {
+      if ((value >= RADIO_RETRANSMITSDELAY_MIN) && (value <= RADIO_RETRANSMITSDELAY_MAX))
+      {
+        config.m_retransmitDelay = value;
+        configChanged = true;
+      }
+    }
+    else if (cmd.m_text.startsWith(F("l")))
+    {
+      if ((value >= PAYLOAD_LENGTH_MIN) && (value <= PAYLOAD_LENGTH_MAX))
+      {
+        payloadLen = value;
+      }
+    }
+#endif
+    cmd.clear();
+    screenUpdate(true);
+  }
+  return configChanged;
+}
+#pragma GCC diagnostic pop
+
 
 void logResults(const t_txData& data)
 {
@@ -304,7 +425,8 @@ void receivedPing(const unsigned long rxTsUs, const t_pingPongData& data)
 {
   (void)rxTsUs;
   // Slave received Ping; Send pong reply with the same data
-  txMsgPingPong.set(const_cast<void*>(static_cast<const void*>(&data)), sizeof(data));
+  txMsgPingPong.set(const_cast<void*>(static_cast<const void*>(&data)), payloadLen);
+
   txData.clear();
   txData.m_txTsUs = micros();
   txData.m_sendOk = send(txMsgPingPong);
@@ -318,7 +440,7 @@ void sendPing(t_txData& data)
   static bool first = true;
   static t_pingPongData pingPongData;
   pingPongData.m_count = first ? 0u : (pingPongData.m_count + 1);
-  txMsgPingPong.set(&pingPongData, sizeof(pingPongData));
+  txMsgPingPong.set(&pingPongData, payloadLen);
 
   // Keep track of data sent and timestamp, then send the ping message
   data.clear();
@@ -363,6 +485,7 @@ void receive(const MyMessage &rxMsg)
 #ifdef MASTER
     receivedPong(rxTsUs, data);
 #else
+    payloadLen = mGetLength(rxMsg);
     receivedPing(rxTsUs, data);
 #endif
 
@@ -388,47 +511,6 @@ void receive(const MyMessage &rxMsg)
   //   Serial.print(F("\tTyp=")); 
   //   Serial.println(rxMsg.type); 
   // }
-}
-
-bool processCommand(t_command& cmd)
-{
-  bool changed = false;
-  if (cmd.m_complete)
-  {
-    int value = cmd.m_text.substring(1, cmd.m_text.length()).toInt();
-    if (cmd.m_text.startsWith(F("x")))
-    {
-      config.setDefault();
-      changed = true;
-    }
-    else if (cmd.m_text.startsWith(F("c")))
-    {
-      config.m_channel = value;
-      changed = true;
-    }
-    else if (cmd.m_text.startsWith(F("r")))
-    {
-      config.m_dataRate = value;
-      changed = true;
-    }
-    else if (cmd.m_text.startsWith(F("l")))
-    {
-      config.m_paLevel = value;
-      changed = true;
-    }
-    else if (cmd.m_text.startsWith(F("t")))
-    {
-      config.m_retransmits = value;
-      changed = true;
-    }
-    else if (cmd.m_text.startsWith(F("d")))
-    {
-      config.m_retransmitDelay = value;
-      changed = true;
-    }
-    cmd.clear();
-  }
-  return changed;
 }
 
 void loop()
@@ -471,7 +553,6 @@ void loop()
     {
 //      Serial.println(F("-- Activating new radio configuration on Master --"));
 //      config.log();
-      screenUpdate(true);
 //      wait(10);
       config.activate();
     }
@@ -481,6 +562,11 @@ void loop()
       Serial.println(F("Configuration of slave node is unknown. Better restart both nodes!"));      
     }
   }
+#endif
+
+#ifdef SLAVE
+  // Slave can only clear/change statistics, not radio settings.
+  (void)processCommand(cmd);
 #endif
 }
 
