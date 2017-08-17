@@ -9,7 +9,7 @@
 #error Define either MASTER or SLAVE to set role of this node
 #endif
 
-#define SKETCH_VERSION_STR     "1.0"
+#define SKETCH_VERSION_STR     "1.1"
 
 #define NODE_ID_MASTER         (100)
 #define NODE_ID_SLAVE          (101)
@@ -123,56 +123,46 @@ struct t_txData
   {
     m_txTsUs       = 0ul;
     m_turnaroundUs = 0ul;
-    m_sendOk       = false;
+    m_txOk         = false;
+    m_rxOk         = false;
     m_rssi         = 0;
   }
   unsigned long  m_txTsUs;        // Ping-message transmit timestamp
   unsigned long  m_turnaroundUs;  // Ping-pong turnaround time. 0 means no pong received (yet)
   t_pingPongData m_data;          // Actual ping-pong data exchanged
-  bool           m_sendOk;        // Result of sending Ping or pong message
+  bool           m_txOk;          // Result of sending Ping or pong message
+  bool           m_rxOk;          // Result of retrieving pong message
   int16_t        m_rssi;          // RSSI of sending Ping or pong message
 };
-static t_txData  txData;
-static MyMessage txMsgPingPong;
-static MyMessage txMsgConfig;
-static t_configData& config = *(static_cast<t_configData*>(txMsgConfig.getCustom()));
-static uint8_t histogramDecayRate = 0;
-static size_t    payloadLen = PAYLOAD_LENGTH_MIN;      // Length of ping-pong payload
+static t_txData  g_txData;
+static MyMessage g_txMsgPingPong;
+static MyMessage g_txMsgConfig;
+static t_configData& g_config = *(static_cast<t_configData*>(g_txMsgConfig.getCustom()));
+static uint8_t g_histogramDecayRate = 0;
+static size_t  g_payloadLen = PAYLOAD_LENGTH_MIN;      // Length of ping-pong payload
 
 // First bucket in histogram is used to store transmitssion failures.
 // This looks most intuitive as the results will be displayed next to the lowest RSSI.
-static histogram<int16_t> histRssi((RSSI_MAX-RSSI_MIN)/RSSI_STEP+1+1, RSSI_MIN-RSSI_STEP/2-RSSI_STEP, RSSI_MAX+RSSI_STEP/2);
+static histogram<int16_t> g_histRssi((RSSI_MAX-RSSI_MIN)/RSSI_STEP+1+1, RSSI_MIN-RSSI_STEP/2-RSSI_STEP, RSSI_MAX+RSSI_STEP/2);
 // Histogram to track succes/fail ratio for transmissions.
-static histogram<uint8_t> histTxOk(2, 0, 2);
+static histogram<uint8_t> g_histTxOk(2, 0, 2);
+// Histogram to track succes/fail ratio for reception (complete ping-pong cycle).
+static histogram<uint8_t> g_histTxRxOk(2, 0, 2);
 
-/*
-void logMenu()
-{
-  Serial.println(F("-- Menu --"));
-  Serial.println(F("c\tSet channel:  Range [0..125] for [2400..2525] [MHz]"));
-  Serial.println(F("r\tSet datarate: 0=1Mb/s, 1=2Mb/s, 2=250Kb/s"));
-  Serial.println(F("l\tSet Pa level: 0=Min, 1=Low, 2=High, 3=Max"));
-  Serial.println(F("t\tSet retransmits: Range [0..15], 0 disables retransmits"));
-  Serial.println(F("d\tSet retransmit delay: Range [0..15] for [250..4000] [us]"));
-  Serial.println(F("x\tReset settings to default"));
-  Serial.println(F("?\tShow this menu"));
-  Serial.println(F(""));
-}
-*/
 
 void before()
 {
   // Prepare ping-pong transmit message to other node.
-  txMsgPingPong.setDestination(MY_PARENT_NODE_ID);
-  txMsgPingPong.setSensor(CHILD_ID_PINGPONG);
-  txMsgPingPong.setType(V_VAR1);  
+  g_txMsgPingPong.setDestination(MY_PARENT_NODE_ID);
+  g_txMsgPingPong.setSensor(CHILD_ID_PINGPONG);
+  g_txMsgPingPong.setType(V_VAR1);  
 
   // Prepare config message.
-  txMsgConfig.setDestination(MY_PARENT_NODE_ID);
-  txMsgConfig.setSensor(CHILD_ID_CONFIG);
-  txMsgConfig.setType(V_VAR1);  
-  config.setDefault();
-  txMsgConfig.set(&config, sizeof(config));  
+  g_txMsgConfig.setDestination(MY_PARENT_NODE_ID);
+  g_txMsgConfig.setSensor(CHILD_ID_CONFIG);
+  g_txMsgConfig.setType(V_VAR1);  
+  g_config.setDefault();
+  g_txMsgConfig.set(&g_config, sizeof(g_config));  
 
   screenUpdate(true);
 }
@@ -210,7 +200,11 @@ String rightAlignStr(const String str, const size_t width, const char fill = ' '
 #define WIDTH_HIST_TXOK_BUCKETS   (WIDTH_HIST_RSSI_BUCKETS)
 #define WIDTH_HIST_TXOK           (WIDTH_HIST_RSSI)
 #define WIDTH_HIST_TXOK_COUNTS    (WIDTH_HIST_RSSI_COUNTS)
-#define ROW_MENU                  (ROW_HIST_TXOK+2)
+#define ROW_HIST_RXOK             (ROW_HIST_RSSI+19)
+#define WIDTH_HIST_RXOK_BUCKETS   (WIDTH_HIST_RSSI_BUCKETS)
+#define WIDTH_HIST_RXOK           (WIDTH_HIST_RSSI)
+#define WIDTH_HIST_RXOK_COUNTS    (WIDTH_HIST_RSSI_COUNTS)
+#define ROW_MENU                  (ROW_HIST_RXOK+2)
 #define COL_WIDTH_MENU            (30)
 
 void screenUpdate(const bool rebuild)
@@ -224,90 +218,122 @@ void screenUpdate(const bool rebuild)
     // Config
     Serial << setForegroundColor(BLUE);
     Serial << xy(1,ROW_CONFIG)                      << F("Channel");
-    Serial << xy(1+COL_WIDTH_CONFIG,ROW_CONFIG)     << boldOn() << rightAlignStr(String(config.m_channel), COL_WIDTH_CONFIG-1) << boldOff();
+    Serial << xy(1+COL_WIDTH_CONFIG,ROW_CONFIG)     << boldOn() << rightAlignStr(String(g_config.m_channel), COL_WIDTH_CONFIG-1) << boldOff();
     Serial << xy(1+2*COL_WIDTH_CONFIG,ROW_CONFIG)   << F("BaseId");
-    Serial << xy(1+3*COL_WIDTH_CONFIG,ROW_CONFIG)   << boldOn() << rightAlignStr(config.toBaseIdStr(&config.m_baseId[0], config.m_addrWidth), COL_WIDTH_CONFIG-1) << boldOff();
+    Serial << xy(1+3*COL_WIDTH_CONFIG,ROW_CONFIG)   << boldOn() << rightAlignStr(g_config.toBaseIdStr(&g_config.m_baseId[0], g_config.m_addrWidth), COL_WIDTH_CONFIG-1) << boldOff();
     Serial << xy(1,ROW_CONFIG+1)                    << F("Datarate");
-    Serial << xy(1+COL_WIDTH_CONFIG,ROW_CONFIG+1)   << boldOn() << rightAlignStr(String(config.rateToStr(config.m_dataRate)), COL_WIDTH_CONFIG-1) << boldOff();
+    Serial << xy(1+COL_WIDTH_CONFIG,ROW_CONFIG+1)   << boldOn() << rightAlignStr(String(g_config.rateToStr(g_config.m_dataRate)), COL_WIDTH_CONFIG-1) << boldOff();
     Serial << xy(1+2*COL_WIDTH_CONFIG,ROW_CONFIG+1) << F("Pa-Level");
-    Serial << xy(1+3*COL_WIDTH_CONFIG,ROW_CONFIG+1) << boldOn() << rightAlignStr(String(config.paLevelToStr(config.m_paLevel)), COL_WIDTH_CONFIG-1) << boldOff();
+    Serial << xy(1+3*COL_WIDTH_CONFIG,ROW_CONFIG+1) << boldOn() << rightAlignStr(String(g_config.paLevelToStr(g_config.m_paLevel)), COL_WIDTH_CONFIG-1) << boldOff();
     Serial << xy(1,ROW_CONFIG+2)                    << F("Retransmits");
-    Serial << xy(1+COL_WIDTH_CONFIG,ROW_CONFIG+2)   << boldOn() << rightAlignStr(String(config.m_retransmits), COL_WIDTH_CONFIG-1) << boldOff();
+    Serial << xy(1+COL_WIDTH_CONFIG,ROW_CONFIG+2)   << boldOn() << rightAlignStr(String(g_config.m_retransmits), COL_WIDTH_CONFIG-1) << boldOff();
     Serial << xy(1+2*COL_WIDTH_CONFIG,ROW_CONFIG+2) << F("RetrDelay");
-    String strDelay = String( uint16_t(config.m_retransmitDelay + 1)*250 );
+    String strDelay = String( uint16_t(g_config.m_retransmitDelay + 1)*250 );
     strDelay += F("us");
     Serial << xy(1+3*COL_WIDTH_CONFIG,ROW_CONFIG+2) << boldOn() << rightAlignStr(strDelay, COL_WIDTH_CONFIG-1) << boldOff() ;
     Serial << xy(1,ROW_CONFIG+3)                    << F("Payload size");
-    Serial << xy(1+COL_WIDTH_CONFIG,ROW_CONFIG+3)   << boldOn() << rightAlignStr(String(payloadLen), COL_WIDTH_CONFIG-1) << boldOff();
+    Serial << xy(1+COL_WIDTH_CONFIG,ROW_CONFIG+3)   << boldOn() << rightAlignStr(String(g_payloadLen), COL_WIDTH_CONFIG-1) << boldOff();
   }
 
   // RSSI histogram
-  int x = WIDTH_HIST_RSSI_BUCKETS+1;
-  int y = ROW_HIST_RSSI;
-  int w = WIDTH_HIST_RSSI;
-  for (size_t b = 0; b < histRssi.size(); ++b)
   {
-    double relcount = histRssi.relcount(b);
-    int xc = int(double(w) * relcount + 0.5);
-    if (rebuild)
+    uint8_t x = WIDTH_HIST_RSSI_BUCKETS+1;
+    uint8_t y = ROW_HIST_RSSI;
+    uint8_t w = WIDTH_HIST_RSSI;
+    for (size_t b = 0; b < g_histRssi.size(); ++b)
     {
-      int16_t db = histRssi.lowerbound(b) + (histRssi.upperbound(b) - histRssi.lowerbound(b)) / 2;
+      double relcount = g_histRssi.relcount(b);
+      int xc = int(double(w) * relcount + 0.5);
+      if (rebuild)
+      {
+        int16_t db = g_histRssi.lowerbound(b) + (g_histRssi.upperbound(b) - g_histRssi.lowerbound(b)) / 2;
 
+        Serial << defaultBackground() << setForegroundColor(YELLOW);
+        Serial << xy(1,y);
+        if (b == 0)
+        {
+          // Special case: Failed transmissions are stored in bucket 0
+          Serial << boldOn() << F("Failed") << boldOff();
+        }
+        else
+        {
+          Serial << db << F(" dB");
+        }
+      }
+      Serial << setBackgroundColor(YELLOW);
+      Serial << fill(x,  y, x+xc-1, y, ' ');
       Serial << defaultBackground() << setForegroundColor(YELLOW);
-      Serial << xy(1,y);
-      if (b == 0)
-      {
-        // Special case: Failed transmissions are stored in bucket 0
-        Serial << boldOn() << F("Failed") << boldOff();
-      }
-      else
-      {
-        Serial << db << F(" dB");
-      }
-    }
-    Serial << setBackgroundColor(YELLOW);
-    Serial << fill(x,  y, x+xc-1, y, ' ');
-    Serial << defaultBackground() << setForegroundColor(YELLOW);
-    Serial << fill(x+xc, y, x+w-1,  y, '-');
+      Serial << fill(x+xc, y, x+w-1,  y, '-');
 
-    Serial << xy(WIDTH_HIST_RSSI_BUCKETS+WIDTH_HIST_RSSI+1+1,y) << boldOn() << rightAlignStr(String(histRssi.count(b)), WIDTH_HIST_RSSI_COUNTS) << boldOff();
-    ++y;
+      Serial << xy(WIDTH_HIST_RSSI_BUCKETS+WIDTH_HIST_RSSI+1+1,y) << boldOn() << rightAlignStr(String(g_histRssi.count(b)), WIDTH_HIST_RSSI_COUNTS) << boldOff();
+      ++y;
+    }
+    // SLowly decrease bucket values, to limit history time
+    g_histRssi.decay(g_histogramDecayRate);
   }
-  // SLowly decrease bucket values, to limit history time
-  histRssi.decay(histogramDecayRate);
 
   // Tx Ok/Fail histogram
-  x = WIDTH_HIST_TXOK_BUCKETS+1;
-  y = ROW_HIST_TXOK;
-  w = WIDTH_HIST_TXOK;  
-  if (rebuild)
   {
-    Serial << defaultBackground() << setForegroundColor(YELLOW);
-    Serial << xy(1,y) << F("Tx ") << setForegroundColor(GREEN) << F("Ok") << setForegroundColor(YELLOW) << '/' <<  setForegroundColor(RED) << F("Fail");
+    uint8_t x = WIDTH_HIST_TXOK_BUCKETS+1;
+    uint8_t y = ROW_HIST_TXOK;
+    uint8_t w = WIDTH_HIST_TXOK;  
+    if (rebuild)
+    {
+      Serial << defaultBackground() << setForegroundColor(YELLOW);
+      Serial << xy(1,y) << F("Tx ") << setForegroundColor(GREEN) << F("Ok") << setForegroundColor(YELLOW) << '/' <<  setForegroundColor(RED) << F("Fail");
+      Serial << defaultForeground();
+    }
+    double relOk = g_histTxOk.relcount(1);
+    int xc = int(double(w) * relOk + 0.5);
+    Serial << setBackgroundColor(GREEN);
+    Serial << fill(x,  y, x+xc-1, y, ' ');
+    Serial << setBackgroundColor(RED);
+    Serial << fill(x+xc, y, x+w-1,  y, ' ');
+    Serial << defaultBackground();
+    uint8_t perc = 100.0*double(g_histTxOk.relcount(1)) + 0.5;
+    String ratio = String(perc);
+    ratio += ' ';
+    ratio += '%';
+    Serial << xy(WIDTH_HIST_TXOK_BUCKETS+WIDTH_HIST_TXOK+1+1,y) << boldOn() << setForegroundColor(GREEN) << rightAlignStr(ratio, WIDTH_HIST_TXOK_COUNTS) << boldOff();
     Serial << defaultForeground();
+    // SLowly decrease bucket values, to limit history time
+    g_histTxOk.decay(g_histogramDecayRate);
   }
-  double relOk = histTxOk.relcount(1);
-  int xc = int(double(w) * relOk + 0.5);
-  Serial << setBackgroundColor(GREEN);
-  Serial << fill(x,  y, x+xc-1, y, ' ');
-  Serial << setBackgroundColor(RED);
-  Serial << fill(x+xc, y, x+w-1,  y, ' ');
-  Serial << defaultBackground();
-  uint8_t perc = 100.0*double(histTxOk.relcount(1)) + 0.5;
-  String ratio = String(perc);
-  ratio += ' ';
-  ratio += '%';
-  Serial << xy(WIDTH_HIST_TXOK_BUCKETS+WIDTH_HIST_TXOK+1+1,y) << boldOn() << setForegroundColor(GREEN) << rightAlignStr(ratio, WIDTH_HIST_TXOK_COUNTS) << boldOff();
-  Serial << defaultForeground();
-  // SLowly decrease bucket values, to limit history time
-  histTxOk.decay(histogramDecayRate);
+
+#ifdef MASTER
+  // Rx Ok/Fail histogram
+  {
+    uint8_t x = WIDTH_HIST_RXOK_BUCKETS+1;
+    uint8_t y = ROW_HIST_RXOK;
+    uint8_t w = WIDTH_HIST_RXOK;  
+    if (rebuild)
+    {
+      Serial << defaultBackground() << setForegroundColor(YELLOW);
+      Serial << xy(1,y) << F("TxRx ") << setForegroundColor(GREEN) << F("Ok") << setForegroundColor(YELLOW) << '/' <<  setForegroundColor(RED) << F("Fail");
+      Serial << defaultForeground();
+    }
+    double relOk = g_histTxRxOk.relcount(1);
+    int xc = int(double(w) * relOk + 0.5);
+    Serial << setBackgroundColor(GREEN);
+    Serial << fill(x,  y, x+xc-1, y, ' ');
+    Serial << setBackgroundColor(RED);
+    Serial << fill(x+xc, y, x+w-1,  y, ' ');
+    Serial << defaultBackground();
+    uint8_t perc = 100.0*double(g_histTxRxOk.relcount(1)) + 0.5;
+    String ratio = String(perc);
+    ratio += ' ';
+    ratio += '%';
+    Serial << xy(WIDTH_HIST_RXOK_BUCKETS+WIDTH_HIST_RXOK+1+1,y) << boldOn() << setForegroundColor(GREEN) << rightAlignStr(ratio, WIDTH_HIST_RXOK_COUNTS) << boldOff();
+    Serial << defaultForeground();
+    // SLowly decrease bucket values, to limit history time
+    g_histTxRxOk.decay(g_histogramDecayRate);
+  }
+#endif
 
   // Menu
   if (rebuild)
   {
     Serial << setForegroundColor(BLUE);
-    //                                              000000000011111111112222222222
-    //                                              012345678901234567890123456789
 #ifdef MASTER
     Serial << xy(1,ROW_MENU)                  << F("cn - Set channel [0..125]");
     Serial << xy(1+COL_WIDTH_MENU,ROW_MENU)   << F("rn - Set datarate [0..2]");
@@ -333,27 +359,28 @@ bool processCommand(t_command& cmd)
     uint8_t value = uint8_t(cmd.m_text.substring(1, cmd.m_text.length()).toInt());
     if (cmd.m_text.startsWith(F("0")))
     {
-      histRssi.clear();
-      histTxOk.clear();
+      g_histRssi.clear();
+      g_histTxOk.clear();
+      g_histTxRxOk.clear();
     }
     else if (cmd.m_text.startsWith(F("d")))
     {
       if ((value >= HISTOGRAM_DECAY_RATE_MIN) && (value <= HISTOGRAM_DECAY_RATE_MAX))
       {
-        histogramDecayRate = value;
+        g_histogramDecayRate = value;
       }
     }
 #ifdef MASTER
     else if (cmd.m_text.startsWith(F("x")))
     {
-      config.setDefault();
+      g_config.setDefault();
       configChanged = true;
     }
     else if (cmd.m_text.startsWith(F("c")))
     {
       if ((value >= RADIO_CHANNEL_MIN) && (value <= RADIO_CHANNEL_MAX))
       {
-        config.m_channel = value;
+        g_config.m_channel = value;
         configChanged = true;
       }
     }
@@ -361,7 +388,7 @@ bool processCommand(t_command& cmd)
     {
       if ((value >= RADIO_DATARATE_MIN) && (value <= RADIO_DATARATE_MAX))
       {
-        config.m_dataRate = value;
+        g_config.m_dataRate = value;
         configChanged = true;
       }
     }
@@ -369,7 +396,7 @@ bool processCommand(t_command& cmd)
     {
       if ((value >= RADIO_PALEVEL_MIN) && (value <= RADIO_PALEVEL_MAX))
       {
-        config.m_paLevel = value;
+        g_config.m_paLevel = value;
         configChanged = true;
       }
     }
@@ -377,7 +404,7 @@ bool processCommand(t_command& cmd)
     {
       if ((value >= RADIO_RETRANSMITS_MIN) && (value <= RADIO_RETRANSMITS_MAX))
       {
-        config.m_retransmits = value;
+        g_config.m_retransmits = value;
         configChanged = true;
       }
     }
@@ -385,7 +412,7 @@ bool processCommand(t_command& cmd)
     {
       if ((value >= RADIO_RETRANSMITSDELAY_MIN) && (value <= RADIO_RETRANSMITSDELAY_MAX))
       {
-        config.m_retransmitDelay = value;
+        g_config.m_retransmitDelay = value;
         configChanged = true;
       }
     }
@@ -393,7 +420,7 @@ bool processCommand(t_command& cmd)
     {
       if ((value >= PAYLOAD_LENGTH_MIN) && (value <= PAYLOAD_LENGTH_MAX))
       {
-        payloadLen = value;
+        g_payloadLen = value;
       }
     }
 #endif
@@ -404,20 +431,22 @@ bool processCommand(t_command& cmd)
 }
 #pragma GCC diagnostic pop
 
+void serialEvent()
+{
+  while(Serial.available())
+  {
+    char c = static_cast<char>(Serial.read());
+    if (c == '\n') cmd.m_complete = true;
+    else           cmd.m_text += c;
+  }
+}
 
 void logResults(const t_txData& data)
 {
-  if (data.m_sendOk)
-  {
-    histTxOk.store(1);
-    histRssi.store(data.m_rssi);
-  }
-  else
-  {
-    histTxOk.store(0);
-    // Special case: Failed transmission is stored in first bucket
-    histRssi.store(RSSI_MIN - RSSI_STEP);
-  }
+  g_histTxOk.store(data.m_txOk ? 1 : 0);
+  g_histTxRxOk.store(data.m_rxOk ? 1 : 0);
+  // If Tx failed: Store in RSSI for first bucket
+  g_histRssi.store(data.m_txOk ? data.m_rssi : (RSSI_MIN - RSSI_STEP));
 }
 
 // Slave: receive ping, send pong
@@ -425,13 +454,13 @@ void receivedPing(const unsigned long rxTsUs, const t_pingPongData& data)
 {
   (void)rxTsUs;
   // Slave received Ping; Send pong reply with the same data
-  txMsgPingPong.set(const_cast<void*>(static_cast<const void*>(&data)), payloadLen);
+  g_txMsgPingPong.set(const_cast<void*>(static_cast<const void*>(&data)), g_payloadLen);
 
-  txData.clear();
-  txData.m_txTsUs = micros();
-  txData.m_sendOk = send(txMsgPingPong);
-  txData.m_rssi   = transportGetSendingRSSI();
-  logResults(txData);
+  g_txData.clear();
+  g_txData.m_txTsUs = micros();
+  g_txData.m_txOk   = send(g_txMsgPingPong);
+  g_txData.m_rssi   = transportGetSendingRSSI();
+  logResults(g_txData);
 }
 
 // Master: Send ping
@@ -440,13 +469,13 @@ void sendPing(t_txData& data)
   static bool first = true;
   static t_pingPongData pingPongData;
   pingPongData.m_count = first ? 0u : (pingPongData.m_count + 1);
-  txMsgPingPong.set(&pingPongData, payloadLen);
+  g_txMsgPingPong.set(&pingPongData, g_payloadLen);
 
   // Keep track of data sent and timestamp, then send the ping message
   data.clear();
   data.m_data   = pingPongData;
   data.m_txTsUs = micros();
-  data.m_sendOk = send(txMsgPingPong);
+  data.m_txOk   = send(g_txMsgPingPong);
   data.m_rssi   = transportGetSendingRSSI();
   first = false;
 }
@@ -455,10 +484,11 @@ void sendPing(t_txData& data)
 void receivedPong(const unsigned long rxTsUs, const t_pingPongData& data)
 {
   // Master received Pong; Store result
-  if (data.m_count == txData.m_data.m_count)
+  if (data.m_count == g_txData.m_data.m_count)
   {
     // This is a pong-reply to the last message sent 
-    txData.m_turnaroundUs = rxTsUs - txData.m_txTsUs;
+    g_txData.m_turnaroundUs = rxTsUs - g_txData.m_txTsUs;
+    g_txData.m_rxOk = true;
   }
 }
 
@@ -471,7 +501,7 @@ bool sendConfig()
     // Serial.print(i+1);
     // Serial.print('/');
     // Serial.println(MAX_NUM_CONFIG_RETRIES); 
-    sendOk = send(txMsgConfig);
+    sendOk = send(g_txMsgConfig);
   }
   return sendOk;
 }
@@ -485,8 +515,14 @@ void receive(const MyMessage &rxMsg)
 #ifdef MASTER
     receivedPong(rxTsUs, data);
 #else
-    payloadLen = mGetLength(rxMsg);
+    size_t len = mGetLength(rxMsg);
+    bool screenRefresh = len != g_payloadLen;
+    g_payloadLen = len;
     receivedPing(rxTsUs, data);
+    if (screenRefresh)
+    {
+      screenUpdate(true);
+    }
 #endif
 
     static uint8_t count = 0;
@@ -499,18 +535,11 @@ void receive(const MyMessage &rxMsg)
   else if ((CHILD_ID_CONFIG == rxMsg.sensor) && (V_VAR1 == rxMsg.type))
   {
     t_configData& newConfig = *(static_cast<t_configData*>(rxMsg.getCustom()));
-    config = newConfig;
+    g_config = newConfig;
     screenUpdate(true);
     wait(10);
-    config.activate();
+    g_config.activate();
   }
-  // else
-  // {
-  //   Serial.print(F("Unhandled message. Sns=")); 
-  //   Serial.print(rxMsg.sensor); 
-  //   Serial.print(F("\tTyp=")); 
-  //   Serial.println(rxMsg.type); 
-  // }
 }
 
 void loop()
@@ -537,10 +566,10 @@ void loop()
       {
         prevMs = prevMs + PING_INTERVAL_MS;
         // Ping-pong has been performed. Log the results.
-        logResults(txData);
+        logResults(g_txData);
       }
       // Initiate next ping-pong
-      sendPing(txData);
+      sendPing(g_txData);
     }
     ++count;
   }
@@ -552,9 +581,9 @@ void loop()
     if (configSentOk)
     {
 //      Serial.println(F("-- Activating new radio configuration on Master --"));
-//      config.log();
+//      g_config.log();
 //      wait(10);
-      config.activate();
+      g_config.activate();
     }
     else
     {
@@ -568,14 +597,4 @@ void loop()
   // Slave can only clear/change statistics, not radio settings.
   (void)processCommand(cmd);
 #endif
-}
-
-void serialEvent()
-{
-  while(Serial.available())
-  {
-    char c = static_cast<char>(Serial.read());
-    if (c == '\n') cmd.m_complete = true;
-    else           cmd.m_text += c;
-  }
 }
