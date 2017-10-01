@@ -1,6 +1,5 @@
-#define MASTER
-//#define SLAVE
-
+//#define MASTER
+#define SLAVE
 
 #if !defined(MASTER) && !defined(SLAVE)
 #error Define either MASTER or SLAVE to set role of this node
@@ -9,7 +8,7 @@
 #error Define either MASTER or SLAVE to set role of this node
 #endif
 
-#define SKETCH_VERSION_STR     "1.1"
+#define SKETCH_VERSION_STR     "1.2"
 
 #define NODE_ID_MASTER         (100)
 #define NODE_ID_SLAVE          (101)
@@ -39,34 +38,11 @@
 //#define MY_DEBUG
 
 #define MY_RADIO_NRF24
-//#define MY_RF24_CHANNEL        (112)    
-//#define MY_RF24_BASE_RADIO_ID  0x00,0xFC,0xE1,0xA8,0xA8
-//#define MY_RF24_DATARATE       (RF24_1MBPS)
 #define MY_RF24_PA_LEVEL       (RF24_PA_MIN)    // Start at low level to prevent issues with nodes close to eachother
-//#define MY_RF24_PA_LEVEL       (RF24_PA_LOW)
-//#define MY_RF24_PA_LEVEL       (RF24_PA_HIGH)
-//#define MY_RF24_PA_LEVEL       (RF24_PA_MAX)
 
 
 #ifndef MY_RADIO_NRF24
 #error Currently only nRF24 radio is supported!
-#endif
-
-
-#ifdef MY_RADIO_NRF24
-#define RSSI_MIN                   (-149.0)
-#define RSSI_MAX                   (-29.0)
-#define RSSI_STEP                  (8.0)
-#define RADIO_CHANNEL_MIN          (0)
-#define RADIO_CHANNEL_MAX          (125)
-#define RADIO_DATARATE_MIN         (0)
-#define RADIO_DATARATE_MAX         (2)
-#define RADIO_PALEVEL_MIN          (0)
-#define RADIO_PALEVEL_MAX          (3)
-#define RADIO_RETRANSMITS_MIN      (0)
-#define RADIO_RETRANSMITS_MAX      (15)
-#define RADIO_RETRANSMITSDELAY_MIN (0)
-#define RADIO_RETRANSMITSDELAY_MAX (15)
 #endif
 
 #define PAYLOAD_LENGTH_MIN         (1)
@@ -80,11 +56,14 @@
 
 #include <MySensors.h>
 #include <AnsiStream.h>
-#include "config.h"
 #include "histogram.h"
+#include "radiorf24.h"
 
 using namespace ANSI;
 
+#ifdef MY_RADIO_NRF24
+static RadioRF24 g_radio;
+#endif
 
 // Serial command buffer
 struct t_command
@@ -137,13 +116,15 @@ struct t_txData
 static t_txData  g_txData;
 static MyMessage g_txMsgPingPong;
 static MyMessage g_txMsgConfig;
-static t_configData& g_config = *(static_cast<t_configData*>(g_txMsgConfig.getCustom()));
+//static t_configData& g_config = *(static_cast<t_configData*>(g_txMsgConfig.getCustom()));
 static uint8_t g_histogramDecayRate = 0;
 static size_t  g_payloadLen = PAYLOAD_LENGTH_MIN;      // Length of ping-pong payload
 
 // First bucket in histogram is used to store transmitssion failures.
 // This looks most intuitive as the results will be displayed next to the lowest RSSI.
-static histogram<int16_t> g_histRssi((RSSI_MAX-RSSI_MIN)/RSSI_STEP+1+1, RSSI_MIN-RSSI_STEP/2-RSSI_STEP, RSSI_MAX+RSSI_STEP/2);
+static histogram<int16_t> g_histRssi((g_radio.GetRssiMax() - g_radio.GetRssiMin()) / g_radio.GetRssiStep() + 1 + 1,
+                                      g_radio.GetRssiMin() - g_radio.GetRssiStep() / 2 - g_radio.GetRssiStep(),
+                                      g_radio.GetRssiMax() + g_radio.GetRssiStep() / 2);
 // Histogram to track succes/fail ratio for transmissions.
 static histogram<uint8_t> g_histTxOk(2, 0, 2);
 // Histogram to track succes/fail ratio for reception (complete ping-pong cycle).
@@ -161,8 +142,8 @@ void before()
   g_txMsgConfig.setDestination(MY_PARENT_NODE_ID);
   g_txMsgConfig.setSensor(CHILD_ID_CONFIG);
   g_txMsgConfig.setType(V_VAR1);  
-  g_config.setDefault();
-  g_txMsgConfig.set(&g_config, sizeof(g_config));  
+//  g_config.setDefault();
+//  g_txMsgConfig.set(&g_config, sizeof(g_config));  
 
   screenUpdate(true);
 }
@@ -190,21 +171,21 @@ String rightAlignStr(const String str, const size_t width, const char fill = ' '
 
 
 #define ROW_HEADER                (1)
-#define ROW_CONFIG                (ROW_HEADER+2)
+#define ROW_CONFIG                (ROW_HEADER + 2)
 #define COL_WIDTH_CONFIG          (15)
-#define ROW_HIST_RSSI             (ROW_CONFIG+5)
+#define ROW_HIST_RSSI             (ROW_CONFIG + 5)
 #define WIDTH_HIST_RSSI_BUCKETS   (COL_WIDTH_CONFIG)
 #define WIDTH_HIST_RSSI           (3*COL_WIDTH_CONFIG)
 #define WIDTH_HIST_RSSI_COUNTS    (10)
-#define ROW_HIST_TXOK             (ROW_HIST_RSSI+18)
+#define ROW_HIST_TXOK             (ROW_HIST_RSSI + g_histRssi.size() + 3)
 #define WIDTH_HIST_TXOK_BUCKETS   (WIDTH_HIST_RSSI_BUCKETS)
 #define WIDTH_HIST_TXOK           (WIDTH_HIST_RSSI)
 #define WIDTH_HIST_TXOK_COUNTS    (WIDTH_HIST_RSSI_COUNTS)
-#define ROW_HIST_RXOK             (ROW_HIST_RSSI+19)
+#define ROW_HIST_RXOK             (ROW_HIST_TXOK + 1)
 #define WIDTH_HIST_RXOK_BUCKETS   (WIDTH_HIST_RSSI_BUCKETS)
 #define WIDTH_HIST_RXOK           (WIDTH_HIST_RSSI)
 #define WIDTH_HIST_RXOK_COUNTS    (WIDTH_HIST_RSSI_COUNTS)
-#define ROW_MENU                  (ROW_HIST_RXOK+2)
+#define ROW_MENU                  (ROW_HIST_RXOK + 2)
 #define COL_WIDTH_MENU            (30)
 
 void screenUpdate(const bool rebuild)
@@ -218,17 +199,24 @@ void screenUpdate(const bool rebuild)
     // Config
     Serial << setForegroundColor(BLUE);
     Serial << xy(1,ROW_CONFIG)                      << F("Channel");
-    Serial << xy(1+COL_WIDTH_CONFIG,ROW_CONFIG)     << boldOn() << rightAlignStr(String(g_config.m_channel), COL_WIDTH_CONFIG-1) << boldOff();
-    Serial << xy(1+2*COL_WIDTH_CONFIG,ROW_CONFIG)   << F("BaseId");
-    Serial << xy(1+3*COL_WIDTH_CONFIG,ROW_CONFIG)   << boldOn() << rightAlignStr(g_config.toBaseIdStr(&g_config.m_baseId[0], g_config.m_addrWidth), COL_WIDTH_CONFIG-1) << boldOff();
+    Serial << xy(1+COL_WIDTH_CONFIG,ROW_CONFIG)     << boldOn() << rightAlignStr(g_radio.ChannelToString(g_radio.GetChannel()), COL_WIDTH_CONFIG-1) << boldOff();
+
+    uint8_t baseId[10];
+    size_t size = sizeof(baseId);
+    if (g_radio.GetBaseId(baseId, size))
+    {
+      Serial << xy(1+2*COL_WIDTH_CONFIG,ROW_CONFIG)   << F("BaseId");
+      Serial << xy(1+3*COL_WIDTH_CONFIG,ROW_CONFIG)   << boldOn() << rightAlignStr(g_radio.BaseIdToString(baseId, size), COL_WIDTH_CONFIG-1) << boldOff();
+    }
     Serial << xy(1,ROW_CONFIG+1)                    << F("Datarate");
-    Serial << xy(1+COL_WIDTH_CONFIG,ROW_CONFIG+1)   << boldOn() << rightAlignStr(String(g_config.rateToStr(g_config.m_dataRate)), COL_WIDTH_CONFIG-1) << boldOff();
+    Serial << xy(1+COL_WIDTH_CONFIG,ROW_CONFIG+1)   << boldOn() << rightAlignStr(g_radio.DataRateToString(g_radio.GetDataRate()), COL_WIDTH_CONFIG-1) << boldOff();
     Serial << xy(1+2*COL_WIDTH_CONFIG,ROW_CONFIG+1) << F("Pa-Level");
-    Serial << xy(1+3*COL_WIDTH_CONFIG,ROW_CONFIG+1) << boldOn() << rightAlignStr(String(g_config.paLevelToStr(g_config.m_paLevel)), COL_WIDTH_CONFIG-1) << boldOff();
+    Serial << xy(1+3*COL_WIDTH_CONFIG,ROW_CONFIG+1) << boldOn() << rightAlignStr(g_radio.PowerLevelToString(g_radio.GetPowerLevel()), COL_WIDTH_CONFIG-1) << boldOff();
     Serial << xy(1,ROW_CONFIG+2)                    << F("Retransmits");
-    Serial << xy(1+COL_WIDTH_CONFIG,ROW_CONFIG+2)   << boldOn() << rightAlignStr(String(g_config.m_retransmits), COL_WIDTH_CONFIG-1) << boldOff();
+    Serial << xy(1+COL_WIDTH_CONFIG,ROW_CONFIG+2)   << boldOn() << rightAlignStr(g_radio.AutoRetransmitsToString(g_radio.GetAutoRetransmits()), COL_WIDTH_CONFIG-1) << boldOff();
     Serial << xy(1+2*COL_WIDTH_CONFIG,ROW_CONFIG+2) << F("RetrDelay");
-    String strDelay = String( uint16_t(g_config.m_retransmitDelay + 1)*250 );
+
+    String strDelay = g_radio.AutoRetransmitDelayToString(g_radio.GetAutoRetransmitDelay());
     strDelay += F("us");
     Serial << xy(1+3*COL_WIDTH_CONFIG,ROW_CONFIG+2) << boldOn() << rightAlignStr(strDelay, COL_WIDTH_CONFIG-1) << boldOff() ;
     Serial << xy(1,ROW_CONFIG+3)                    << F("Payload size");
@@ -335,11 +323,11 @@ void screenUpdate(const bool rebuild)
   {
     Serial << setForegroundColor(BLUE);
 #ifdef MASTER
-    Serial << xy(1,ROW_MENU)                  << F("cn - Set channel [0..125]");
-    Serial << xy(1+COL_WIDTH_MENU,ROW_MENU)   << F("rn - Set datarate [0..2]");
-    Serial << xy(1,ROW_MENU+1)                << F("pn - Set PaLevel [0..3]");
-    Serial << xy(1+COL_WIDTH_MENU,ROW_MENU+1) << F("tn - Set retransmits [0..15]");
-    Serial << xy(1,ROW_MENU+2)                << F("yn - Set retr. delay [0..15]");
+    Serial << xy(1,ROW_MENU)                  << F("cn - Set channel [") << int(g_radio.GetChannelMin()) << F("..") << int(g_radio.GetChannelMax()) << ']';
+    Serial << xy(1+COL_WIDTH_MENU,ROW_MENU)   << F("rn - Set datarate [") << int(g_radio.GetDataRateMin()) << F("..") << int(g_radio.GetDataRateMax()) << ']';
+    Serial << xy(1,ROW_MENU+1)                << F("pn - Set PaLevel [") << int(g_radio.GetPowerLevelMin()) << F("..") << int(g_radio.GetPowerLevelMax()) << ']';
+    Serial << xy(1+COL_WIDTH_MENU,ROW_MENU+1) << F("tn - Set retransmits [") << int(g_radio.GetAutoRetransmitsMin()) << F("..") << int(g_radio.GetAutoRetransmitsMax()) << ']';
+    Serial << xy(1,ROW_MENU+2)                << F("yn - Set retr. delay [") << int(g_radio.GetAutoRetransmitDelayMin()) << F("..") << int(g_radio.GetAutoRetransmitDelayMax()) << ']';
     Serial << xy(1,ROW_MENU+3)                << F("ln - Set payload len [1..") << MAX_PAYLOAD << ']';
     Serial << xy(1+COL_WIDTH_MENU,ROW_MENU+3) << F("x - Reset settings");
 #endif
@@ -373,47 +361,42 @@ bool processCommand(t_command& cmd)
 #ifdef MASTER
     else if (cmd.m_text.startsWith(F("x")))
     {
-      g_config.setDefault();
+      g_radio.SetConfigDefault();
       configChanged = true;
     }
     else if (cmd.m_text.startsWith(F("c")))
     {
-      if ((value >= RADIO_CHANNEL_MIN) && (value <= RADIO_CHANNEL_MAX))
+      if ((value >= g_radio.GetChannelMin()) and (value <= g_radio.GetChannelMax()))
       {
-        g_config.m_channel = value;
-        configChanged = true;
+        configChanged = g_radio.SetChannel(value);
       }
     }
     else if (cmd.m_text.startsWith(F("r")))
     {
-      if ((value >= RADIO_DATARATE_MIN) && (value <= RADIO_DATARATE_MAX))
+      if ((value >= g_radio.GetDataRateMin()) and (value <= g_radio.GetDataRateMax()))
       {
-        g_config.m_dataRate = value;
-        configChanged = true;
+        configChanged = g_radio.SetDataRate(value);
       }
     }
     else if (cmd.m_text.startsWith(F("p")))
     {
-      if ((value >= RADIO_PALEVEL_MIN) && (value <= RADIO_PALEVEL_MAX))
+      if ((value >= g_radio.GetPowerLevelMin()) and (value <= g_radio.GetPowerLevelMax()))
       {
-        g_config.m_paLevel = value;
-        configChanged = true;
+        configChanged = g_radio.SetPowerLevel(value);
       }
     }
     else if (cmd.m_text.startsWith(F("t")))
     {
-      if ((value >= RADIO_RETRANSMITS_MIN) && (value <= RADIO_RETRANSMITS_MAX))
+      if ((value >= g_radio.GetAutoRetransmitsMin()) and (value <= g_radio.GetAutoRetransmitsMax()))
       {
-        g_config.m_retransmits = value;
-        configChanged = true;
+        configChanged = g_radio.SetAutoRetransmits(value);
       }
     }
     else if (cmd.m_text.startsWith(F("y")))
     {
-      if ((value >= RADIO_RETRANSMITSDELAY_MIN) && (value <= RADIO_RETRANSMITSDELAY_MAX))
+      if ((value >= g_radio.GetAutoRetransmitDelayMin()) and (value <= g_radio.GetAutoRetransmitDelayMax()))
       {
-        g_config.m_retransmitDelay = value;
-        configChanged = true;
+        configChanged = g_radio.SetAutoRetransmitDelay(value);
       }
     }
     else if (cmd.m_text.startsWith(F("l")))
@@ -446,7 +429,7 @@ void logResults(const t_txData& data)
   g_histTxOk.store(data.m_txOk ? 1 : 0);
   g_histTxRxOk.store(data.m_rxOk ? 1 : 0);
   // If Tx failed: Store in RSSI for first bucket
-  g_histRssi.store(data.m_txOk ? data.m_rssi : (RSSI_MIN - RSSI_STEP));
+  g_histRssi.store(data.m_txOk ? data.m_rssi : (g_radio.GetRssiMin() - g_radio.GetRssiStep()));
 }
 
 // Slave: receive ping, send pong
@@ -495,13 +478,18 @@ void receivedPong(const unsigned long rxTsUs, const t_pingPongData& data)
 bool sendConfig()
 {
   bool sendOk = false;
-  for (size_t i = 0; !sendOk && (i < MAX_NUM_CONFIG_RETRIES); ++i)
+  size_t size = MAX_PAYLOAD;
+  if (g_radio.ConfigSerialize(static_cast<uint8_t*>(g_txMsgConfig.getCustom()), size))
   {
-    // Serial.print(F("Send config. Attempt "));
-    // Serial.print(i+1);
-    // Serial.print('/');
-    // Serial.println(MAX_NUM_CONFIG_RETRIES); 
-    sendOk = send(g_txMsgConfig);
+    mSetLength(g_txMsgConfig, size);
+    for (size_t i = 0; !sendOk && (i < MAX_NUM_CONFIG_RETRIES); ++i)
+    {
+      // Serial.print(F("Send config. Attempt "));
+      // Serial.print(i+1);
+      // Serial.print('/');
+      // Serial.println(MAX_NUM_CONFIG_RETRIES); 
+      sendOk = send(g_txMsgConfig);
+    }
   }
   return sendOk;
 }
@@ -534,11 +522,14 @@ void receive(const MyMessage &rxMsg)
   }
   else if ((CHILD_ID_CONFIG == rxMsg.sensor) && (V_VAR1 == rxMsg.type))
   {
-    t_configData& newConfig = *(static_cast<t_configData*>(rxMsg.getCustom()));
-    g_config = newConfig;
-    screenUpdate(true);
-    wait(10);
-    g_config.activate();
+    // New radio config received
+
+    if (g_radio.ConfigDeserialize(const_cast<const uint8_t*>(static_cast<uint8_t*>(rxMsg.getCustom())), mGetLength(rxMsg)))
+    {
+      screenUpdate(true);
+      wait(10);
+      g_radio.ConfigActivate();
+    }
   }
 }
 
@@ -583,7 +574,7 @@ void loop()
 //      Serial.println(F("-- Activating new radio configuration on Master --"));
 //      g_config.log();
 //      wait(10);
-      g_config.activate();
+      g_radio.ConfigActivate();
     }
     else
     {
