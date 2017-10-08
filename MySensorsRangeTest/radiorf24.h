@@ -13,8 +13,9 @@ public:
   bool ConfigDeserialize(const uint8_t * in, const size_t size) override;
 
   bool SanityCheck() override { return RF24_sanityCheck(); }
+  String GetName() override { return F("nRF24L01+"); };
 
-  bool GetBaseId(uint8_t * out, size_t& size) override;
+  bool   GetBaseId(uint8_t * out, size_t& size) override;
   String BaseIdToString(const uint8_t * baseId, const size_t size) override;
 
   int16_t GetRssi() override;

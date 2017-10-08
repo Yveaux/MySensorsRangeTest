@@ -13,8 +13,9 @@ public:
   virtual bool ConfigDeserialize(const uint8_t * in, const size_t size) = 0;
 
   virtual bool SanityCheck() = 0;
+  virtual String GetName() = 0;
 
-  virtual bool GetBaseId(uint8_t * out, size_t& size)  { (void)out; (void)size; return false; };
+  virtual bool   GetBaseId(uint8_t * out, size_t& size)  { (void)out; (void)size; return false; };
   virtual String BaseIdToString(const uint8_t * baseId, const size_t size) { (void)baseId; (void)size; return String(); };
 
   virtual int16_t GetRssi()     { return 0; };

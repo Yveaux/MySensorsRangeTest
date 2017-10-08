@@ -13,9 +13,7 @@ public:
   bool ConfigDeserialize(const uint8_t * in, const size_t size) override;
 
   bool SanityCheck() override { return RFM69_sanityCheck(); }
-
-  bool   GetBaseId(uint8_t * out, size_t& size) override;
-  String BaseIdToString(const uint8_t * baseId, const size_t size) override;
+  String GetName() override { return F("RFM69"); };
 
   int16_t GetRssi() override;
   int16_t GetRssiMin() override  { return -115; };                // Datasheet: DR_RSSI
@@ -103,17 +101,6 @@ bool RadioRFM69::ConfigActivate()
   return ok;
 }
 
-bool RadioRFM69::GetBaseId(uint8_t * out, size_t& size)
-{
-  if ((not out) or (size < m_addrWidth))
-    return false;
-
-  size = m_addrWidth;
-
-  (void)memcpy(out, m_baseId, size);
-  return true;
-}
-
 bool RadioRFM69::ConfigSerialize(uint8_t * out, size_t& size)
 {
   if (not out)
@@ -195,7 +182,7 @@ uint32_t RadioRFM69::GetFrequencyMaxHz()
 
 bool RadioRFM69::SetPowerLevel(const int8_t level)
 {
-  if ((level < RFM69_MIN_POWER_LEVEL_DBM) or (level <= RFM69_MAX_POWER_LEVEL_DBM))
+  if ((level < RFM69_MIN_POWER_LEVEL_DBM) or (level > RFM69_MAX_POWER_LEVEL_DBM))
     return false;
 
   m_radioConfig.m_powerLevel = level;
@@ -218,20 +205,6 @@ String RadioRFM69::ConfigToString()
   return String();
 }
 
-
-String RadioRFM69::BaseIdToString(const uint8_t * baseId, const size_t size)
-{
-  if ((not baseId) or (size == 0))
-    return String();
-  
-  String s = "0x";
-  for (size_t i = size-1; i != size_t(-1); --i)
-  {
-    s += ToHexStr(baseId[i]);
-  }
-  return s;
-}
-
 // String RadioRFM69::DataRateToString(const uint8_t rate)
 // {
 //   switch(rate)
@@ -245,13 +218,6 @@ String RadioRFM69::BaseIdToString(const uint8_t * baseId, const size_t size)
 
 String RadioRFM69::PowerLevelToString(const int8_t level)
 {
-  switch(level)
-  {
-    // case RF24_PA_MIN:  return F("Min");
-    // case RF24_PA_LOW:  return F("Low");
-    // case RF24_PA_HIGH: return F("High");
-    // case RF24_PA_MAX:  return F("Max");
-  }
-  return F("Unknown");
+  return String(level) + F("dBm");
 }
 

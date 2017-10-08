@@ -82,6 +82,7 @@
 #define HISTOGRAM_DECAY_RATE_MIN   (0)
 #define HISTOGRAM_DECAY_RATE_MAX   (10)
 #define HISTOGRAM_RSSI_MAX_BUCKETS (25)
+#define PING_INTERVAL_DEFAULT_MS   (500)
 
 //#ifdef MASTER
 //#define MY_INDICATION_HANDLER
@@ -165,7 +166,7 @@ static histogram<uint8_t> g_histTxOk(2, 0, 2);
 // Histogram to track succes/fail ratio for reception (complete ping-pong cycle).
 static histogram<uint8_t> g_histTxRxOk(2, 0, 2);
 const uint32_t freqDisplayStep = 1000000ul;
-static uint16_t g_pingIntervalMs = 500;    // Interval for the master to emit a Ping message
+static uint16_t g_pingIntervalMs = PING_INTERVAL_DEFAULT_MS;    // Interval for the master to emit a Ping message
 
 void before()
 {
@@ -253,8 +254,9 @@ void screenUpdate(const bool rebuild)
   {
     Serial << home() << eraseScreen() << defaultBackground() << defaultForeground();
     // Header
-    Serial << setForegroundColor(YELLOW);
-    Serial << xy(x,y) << boldOn() << F("MySensors range test ") << F(SKETCH_VERSION_STR) << F(" -- ") << F(ROLE_STR) << boldOff();
+    Serial << setForegroundColor(YELLOW)
+           << xy(x,y) << boldOn() << F("MySensors range test ") << F(SKETCH_VERSION_STR)
+           << F(" -- ") << g_radio.GetName() << F(" -- ") << F(ROLE_STR) << boldOff();
     y += 2;
     // Config
     Serial << setForegroundColor(CYAN);
@@ -297,9 +299,7 @@ void screenUpdate(const bool rebuild)
     {
       Serial << xy(x,y) << F("Retrans. delay");
       nextCol(x, y, COL_WIDTH_CONFIG, ROW_WIDTH);
-      String s = g_radio.AutoRetransmitDelayToString(g_radio.GetAutoRetransmitDelay());
-      s += F("us");
-      Serial << xy(x,y) << rightAlignStr(s, COL_WIDTH_CONFIG-1);
+      Serial << xy(x,y) << rightAlignStr(g_radio.AutoRetransmitDelayToString(g_radio.GetAutoRetransmitDelay()) + F("us"), COL_WIDTH_CONFIG-1);
       nextCol(x, y, COL_WIDTH_CONFIG, ROW_WIDTH);
     }
     Serial << xy(x,y) << F("Payload size");
@@ -307,13 +307,9 @@ void screenUpdate(const bool rebuild)
     Serial << xy(x,y) << rightAlignStr(String(g_payloadLen), COL_WIDTH_CONFIG-1) << boldOff();
     nextCol(x, y, COL_WIDTH_CONFIG, ROW_WIDTH);
 
-    {
-      Serial << xy(x,y) << F("Ping interval");
-      nextCol(x, y, COL_WIDTH_CONFIG, ROW_WIDTH);
-      String s = String(g_pingIntervalMs);
-      s += F("ms");
-      Serial << xy(x,y) << rightAlignStr(s, COL_WIDTH_CONFIG-1);
-    }
+    Serial << xy(x,y) << F("Ping interval");
+    nextCol(x, y, COL_WIDTH_CONFIG, ROW_WIDTH);
+    Serial << xy(x,y) << rightAlignStr(String(g_pingIntervalMs) + F("ms"), COL_WIDTH_CONFIG-1);
   }
 
   // Store y position of histogram. This is needed when redrawing only the histogram.
@@ -335,19 +331,9 @@ void screenUpdate(const bool rebuild)
       if (rebuild)
       {
         int16_t db = g_histRssi.lowerbound(b) + (g_histRssi.upperbound(b) - g_histRssi.lowerbound(b)) / 2;
-
-        String label;
-        if (b == 0)
-        {
-          // Special case: Failed transmissions are stored in bucket 0
-          label = F("Failed");
-        }
-        else
-        {
-          label = String(db);
-          label += F(" dB");
-        }
-        Serial << xy(1,y) << defaultBackground() << setForegroundColor(YELLOW) << rightAlignStr(label, WIDTH_HIST_RSSI_BUCKETS-1);
+        // Special case: Failed transmissions are stored in bucket 0
+        String s = (b == 0) ? String(F("Failed")) : (String(db) + F(" dB"));
+        Serial << xy(1,y) << defaultBackground() << setForegroundColor(YELLOW) << rightAlignStr(s, WIDTH_HIST_RSSI_BUCKETS-1);
       }
       Serial << setBackgroundColor(YELLOW);
       Serial << fill(x,  y, x+xc-1, y, ' ');
@@ -380,10 +366,7 @@ void screenUpdate(const bool rebuild)
     Serial << fill(x+xc, y, x+w-1,  y, ' ');
     Serial << defaultBackground();
     uint8_t perc = 100.0*double(g_histTxOk.relcount(1)) + 0.5;
-    String ratio = String(perc);
-    ratio += ' ';
-    ratio += '%';
-    Serial << xy(WIDTH_HIST_TXOK_BUCKETS+WIDTH_HIST_TXOK,y) << setForegroundColor(GREEN) << rightAlignStr(ratio, WIDTH_HIST_TXOK_COUNTS) << boldOff();
+    Serial << xy(WIDTH_HIST_TXOK_BUCKETS+WIDTH_HIST_TXOK,y) << setForegroundColor(GREEN) << rightAlignStr(String(perc) + F(" %"), WIDTH_HIST_TXOK_COUNTS) << boldOff();
     Serial << defaultForeground();
     // SLowly decrease bucket values, to limit history time
     g_histTxOk.decay(g_histogramDecayRate);
@@ -409,10 +392,7 @@ void screenUpdate(const bool rebuild)
     Serial << fill(x+xc, y, x+w-1,  y, ' ');
     Serial << defaultBackground();
     uint8_t perc = 100.0*double(g_histTxRxOk.relcount(1)) + 0.5;
-    String ratio = String(perc);
-    ratio += ' ';
-    ratio += '%';
-    Serial << xy(WIDTH_HIST_RXOK_BUCKETS+WIDTH_HIST_RXOK,y) << setForegroundColor(GREEN) << rightAlignStr(ratio, WIDTH_HIST_RXOK_COUNTS) << boldOff();
+    Serial << xy(WIDTH_HIST_RXOK_BUCKETS+WIDTH_HIST_RXOK,y) << setForegroundColor(GREEN) << rightAlignStr(String(perc) + F(" %"), WIDTH_HIST_RXOK_COUNTS) << boldOff();
     Serial << defaultForeground();
     // SLowly decrease bucket values, to limit history time
     g_histTxRxOk.decay(g_histogramDecayRate);
@@ -464,7 +444,9 @@ void screenUpdate(const bool rebuild)
     nextCol(x, y, COL_WIDTH_MENU, ROW_WIDTH);
     Serial << xy(x,y) << F("dn - Histogram decay [0..5]");
   }
-  Serial << home();
+  // Position cursor on next line. Any serial prints in the rest of the program will end up here.
+  ++y;
+  Serial << xy(1,y);
 #endif // ifndef MY_DEBUG
 }
 
@@ -493,6 +475,7 @@ bool processCommand(t_command& cmd)
     else if (cmd.m_text.startsWith(F("x")))
     {
       g_radio.SetConfigDefault();
+      g_pingIntervalMs = PING_INTERVAL_DEFAULT_MS;
       configChanged = true;
     }
     else if (cmd.m_text.startsWith(F("f")))
@@ -653,8 +636,6 @@ void receive(const MyMessage &rxMsg)
       screenUpdate(true);
     }
 #endif
-
-//    screenUpdate(false);
   }
   else if ((CHILD_ID_CONFIG == rxMsg.sensor) && (V_VAR1 == rxMsg.type))
   {
