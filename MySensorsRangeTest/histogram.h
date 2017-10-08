@@ -4,9 +4,11 @@ template<typename T>
 class histogram
 {
 public:
+	histogram();
 	histogram(const size_t numBuckets, const T lowerBound, const T upperBound);
 	~histogram();
 
+	void resize(const size_t numBuckets, const T lowerBound, const T upperBound);
 	void clear();
 	void store(const T value);
 	size_t size() const;
@@ -19,6 +21,7 @@ public:
 	void decay( const size_t amount );
 
 private:
+	void release();
 	size_t whichbucket(const T value) const;
 	size_t 	m_numBuckets;
 	T* 	   	m_bounds;
@@ -27,9 +30,31 @@ private:
 };
 
 template<typename T>
+histogram<T>::histogram()
+ :   m_numBuckets(0)
+	 , m_bounds(nullptr)
+	 , m_counts(nullptr)
+{
+}
+
+template<typename T>
 histogram<T>::histogram(const size_t numBuckets, const T lowerBound, const T upperBound)
  : m_numBuckets(numBuckets)
 {
+	resize(numBuckets, lowerBound, upperBound);
+}
+
+template<typename T>
+histogram<T>::~histogram()
+{
+	release();
+}
+
+template<typename T>
+void histogram<T>::resize(const size_t numBuckets, const T lowerBound, const T upperBound)
+{
+	release();
+	m_numBuckets = numBuckets;
 	m_counts = new size_t[numBuckets];
 	m_bounds = new T[numBuckets + 1];
 	T bound = lowerBound;
@@ -43,10 +68,13 @@ histogram<T>::histogram(const size_t numBuckets, const T lowerBound, const T upp
 }
 
 template<typename T>
-histogram<T>::~histogram()
+void histogram<T>::release()
 {
 	delete [] m_bounds;
 	delete [] m_counts;
+	m_bounds = nullptr;
+	m_counts = nullptr;
+	m_numBuckets = 0;
 }
 
 template<typename T>

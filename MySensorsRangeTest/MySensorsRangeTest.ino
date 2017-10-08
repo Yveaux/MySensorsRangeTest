@@ -1,5 +1,23 @@
 //#define MASTER
-#define SLAVE
+//#define SLAVE
+#if !defined(MASTER) && !defined(SLAVE)
+#define MASTER
+#endif
+
+//#define MY_RADIO_NRF24
+#define MY_RADIO_RFM69
+
+// Default Pinout (use 3.3V Arduino for RFM69!)
+//         nRF24    RFM69H(W)  nrf2rfm69  Arduino
+// GND     1        GND        1          GND
+// 3.3V    2        3.3V       2          3.3V
+// CE      3        -          -          9
+// CSN     4        NSS        4          10
+// SCK     5        SCK        5          13
+// MOSI    6        MOSI       6          11
+// MISO    7        MISO       7          12
+// IRQ     8        DIO0       8          2
+// RESET   -        RESET      3          9
 
 #if !defined(MASTER) && !defined(SLAVE)
 #error Define either MASTER or SLAVE to set role of this node
@@ -10,16 +28,17 @@
 
 #define SKETCH_VERSION_STR     "1.2"
 
-#define NODE_ID_MASTER         (100)
-#define NODE_ID_SLAVE          (101)
-#define SCREEN_UPDATE_COUNT    (10)     // Update screen each xx Ping-pong sequences
-#define MAX_NUM_CONFIG_RETRIES (10)     // Number of transmission attempts when changing config
+#define NODE_ID_MASTER            (100)
+#define NODE_ID_SLAVE             (101)
+#define SCREEN_UPDATE_INTERVAL_MS (1000)     // Update interval for screen updates, in [ms]
+#define MAX_NUM_CONFIG_RETRIES    (10)       // Number of transmission attempts when changing config
+#define MIN_PING_INTERVAL_MS      (10)
+#define MAX_PING_INTERVAL_MS      (5000)
 
 #ifdef MASTER
 #define MY_NODE_ID             NODE_ID_MASTER
 #define MY_PARENT_NODE_ID      NODE_ID_SLAVE
 #define ROLE_STR               "Master"       
-#define PING_INTERVAL_MS       (100)    // Interval for the master to emit a Ping message
 #endif
 
 #ifdef SLAVE
@@ -37,18 +56,32 @@
 // #undef MY_REGISTRATION_FEATURE in MyConfig.h to speed up startup by 2 seconds
 //#define MY_DEBUG
 
-#define MY_RADIO_NRF24
+#if defined(MY_RADIO_NRF24)
 #define MY_RF24_PA_LEVEL       (RF24_PA_MIN)    // Start at low level to prevent issues with nodes close to eachother
-
-
-#ifndef MY_RADIO_NRF24
-#error Currently only nRF24 radio is supported!
+#elif defined(MY_RADIO_RFM69)
+#define MY_RFM69_NEW_DRIVER
+//#define MY_DEBUG_VERBOSE_RFM69
+#define MY_RFM69_ATC_MODE_DISABLED
+#define MY_RFM69_TX_POWER_DBM       (-2)
+//void RFM69_ATCmode(const bool onOff, const int16_t targetRSSI)
+// REF: https://www.mysensors.org/download/sensor_api_20
+#define MY_IS_RFM69HW
+#define MY_RFM69_RST_PIN (9)
+// #define MY_RFM69_IRQ_PIN       Default 2
+// #define MY_RFM69_IRQ_NUM       DigitalPinToInterrupt(MY_RFM69_IRQ_PIN)
+// #define DEFAULT_RFM69_CS_PIN   Default (SS)   
+// #define MY_RFM69_FREQUENCY     Default RFM69_868MHZ
+// #define MY_RFM69_NETWORKID     Default 100
+// Required? MY_RFM69_ENABLE_LISTENMODE
+#else
+#error A supported radio must be selected!
 #endif
 
 #define PAYLOAD_LENGTH_MIN         (1)
 #define PAYLOAD_LENGTH_MAX         (MAX_PAYLOAD)
 #define HISTOGRAM_DECAY_RATE_MIN   (0)
 #define HISTOGRAM_DECAY_RATE_MAX   (10)
+#define HISTOGRAM_RSSI_MAX_BUCKETS (25)
 
 //#ifdef MASTER
 //#define MY_INDICATION_HANDLER
@@ -57,13 +90,16 @@
 #include <MySensors.h>
 #include <AnsiStream.h>
 #include "histogram.h"
+
+#if defined(MY_RADIO_NRF24)
 #include "radiorf24.h"
+static RadioRF24 g_radio;
+#elif defined(MY_RADIO_RFM69)
+#include "radiorfm69.h"
+static RadioRFM69 g_radio;
+#endif
 
 using namespace ANSI;
-
-#ifdef MY_RADIO_NRF24
-static RadioRF24 g_radio;
-#endif
 
 // Serial command buffer
 struct t_command
@@ -80,7 +116,7 @@ struct t_command
   String m_text;
   bool   m_complete;
 };
-static t_command cmd;
+static t_command g_serialCommand;
 
 // Actual data exchanged as ping-pong message 
 #pragma pack(push, 1)
@@ -122,16 +158,46 @@ static size_t  g_payloadLen = PAYLOAD_LENGTH_MIN;      // Length of ping-pong pa
 
 // First bucket in histogram is used to store transmitssion failures.
 // This looks most intuitive as the results will be displayed next to the lowest RSSI.
-static histogram<int16_t> g_histRssi((g_radio.GetRssiMax() - g_radio.GetRssiMin()) / g_radio.GetRssiStep() + 1 + 1,
-                                      g_radio.GetRssiMin() - g_radio.GetRssiStep() / 2 - g_radio.GetRssiStep(),
-                                      g_radio.GetRssiMax() + g_radio.GetRssiStep() / 2);
+static histogram<int16_t> g_histRssi;
 // Histogram to track succes/fail ratio for transmissions.
 static histogram<uint8_t> g_histTxOk(2, 0, 2);
 // Histogram to track succes/fail ratio for reception (complete ping-pong cycle).
 static histogram<uint8_t> g_histTxRxOk(2, 0, 2);
-
+const uint32_t freqDisplayStep = 1000000ul;
+static uint16_t g_pingIntervalMs = 500;    // Interval for the master to emit a Ping message
 
 void before()
+{
+  // Clear eeprom, in case any old settings are preset
+  for (size_t i = 0; i < EEPROM_LOCAL_CONFIG_ADDRESS; ++i)
+  {
+    hwWriteConfig(i, 0xFF);
+  } 
+
+  // Define RSSI histogram size
+  const auto rssiMin  = g_radio.GetRssiMin();
+  const auto rssiMax  = g_radio.GetRssiMax();
+  const auto rssiRange = rssiMax - rssiMin;
+  auto rssiStep = g_radio.GetRssiStep();
+
+  const size_t extraBuckets = 2;       // +1 for rounding, +1 for failure bucket
+  size_t numBuckets;
+  for(;;)
+  {
+    numBuckets = rssiRange / rssiStep;
+    if (numBuckets <= (HISTOGRAM_RSSI_MAX_BUCKETS - extraBuckets))
+      break;
+    ++rssiStep;
+  } 
+  numBuckets += extraBuckets;
+  g_histRssi.resize( numBuckets,
+                     rssiMin - rssiStep / 2 - rssiStep /*failure bucket*/,
+                     rssiMax + rssiStep / 2 + 1 /*+1 for rounding*/);
+
+  screenUpdate(true);
+}
+
+void setup()
 {
   // Prepare ping-pong transmit message to other node.
   g_txMsgPingPong.setDestination(MY_PARENT_NODE_ID);
@@ -142,91 +208,122 @@ void before()
   g_txMsgConfig.setDestination(MY_PARENT_NODE_ID);
   g_txMsgConfig.setSensor(CHILD_ID_CONFIG);
   g_txMsgConfig.setType(V_VAR1);  
-//  g_config.setDefault();
-//  g_txMsgConfig.set(&g_config, sizeof(g_config));  
-
-  screenUpdate(true);
+  //  g_config.setDefault();
+  //  g_txMsgConfig.set(&g_config, sizeof(g_config));  
 }
 
-void setup()
-{
-}
-
-String rightAlignStr(const String str, const size_t width, const char fill = ' ')
-{
-  if (str.length() >= width)
-  {
-    return str.substring(str.length() - width);
-  }
-
-  String s;
-  size_t i = width - str.length();
-  do
-  {
-    s += fill;
-  } while (--i != 0);
-  s += str;
-  return s;
-}
-
-
-#define ROW_HEADER                (1)
-#define ROW_CONFIG                (ROW_HEADER + 2)
-#define COL_WIDTH_CONFIG          (15)
-#define ROW_HIST_RSSI             (ROW_CONFIG + 5)
-#define WIDTH_HIST_RSSI_BUCKETS   (COL_WIDTH_CONFIG)
-#define WIDTH_HIST_RSSI           (3*COL_WIDTH_CONFIG)
-#define WIDTH_HIST_RSSI_COUNTS    (10)
-#define ROW_HIST_TXOK             (ROW_HIST_RSSI + g_histRssi.size() + 3)
+#define ROW_WIDTH                 (60)
+#define COL_WIDTH_CONFIG          (ROW_WIDTH/4)
+#define WIDTH_HIST_RSSI_BUCKETS   (8)
+#define WIDTH_HIST_RSSI_COUNTS    (8)
+#define WIDTH_HIST_RSSI           (ROW_WIDTH-WIDTH_HIST_RSSI_BUCKETS-WIDTH_HIST_RSSI_COUNTS)
 #define WIDTH_HIST_TXOK_BUCKETS   (WIDTH_HIST_RSSI_BUCKETS)
 #define WIDTH_HIST_TXOK           (WIDTH_HIST_RSSI)
 #define WIDTH_HIST_TXOK_COUNTS    (WIDTH_HIST_RSSI_COUNTS)
-#define ROW_HIST_RXOK             (ROW_HIST_TXOK + 1)
 #define WIDTH_HIST_RXOK_BUCKETS   (WIDTH_HIST_RSSI_BUCKETS)
 #define WIDTH_HIST_RXOK           (WIDTH_HIST_RSSI)
 #define WIDTH_HIST_RXOK_COUNTS    (WIDTH_HIST_RSSI_COUNTS)
-#define ROW_MENU                  (ROW_HIST_RXOK + 2)
-#define COL_WIDTH_MENU            (30)
+#define COL_WIDTH_MENU            (ROW_WIDTH/2)
+
+void nextCol(uint8_t& col, uint8_t& row, const uint8_t colWidth, const uint8_t rowWidth)
+{
+  col += colWidth;
+  if (col > rowWidth - colWidth + 1)
+  {
+    col = 1;
+    ++row;
+  }
+}
 
 void screenUpdate(const bool rebuild)
 {
+#ifndef MY_DEBUG
+  static unsigned long prevMs = millis();
+  const unsigned long nowMs = millis();
+  if (not (rebuild or ((nowMs - prevMs) >= SCREEN_UPDATE_INTERVAL_MS)))
+  {
+    return;
+  }
+  prevMs = nowMs;
+
+  uint8_t x = 1;
+  uint8_t y = 1;
   if (rebuild)
   {
     Serial << home() << eraseScreen() << defaultBackground() << defaultForeground();
     // Header
     Serial << setForegroundColor(YELLOW);
-    Serial << xy(1,ROW_HEADER) << boldOn() << F("MySensors range test ") << F(SKETCH_VERSION_STR) << F(" -- ") << F(ROLE_STR) << boldOff();
+    Serial << xy(x,y) << boldOn() << F("MySensors range test ") << F(SKETCH_VERSION_STR) << F(" -- ") << F(ROLE_STR) << boldOff();
+    y += 2;
     // Config
-    Serial << setForegroundColor(BLUE);
-    Serial << xy(1,ROW_CONFIG)                      << F("Channel");
-    Serial << xy(1+COL_WIDTH_CONFIG,ROW_CONFIG)     << boldOn() << rightAlignStr(g_radio.ChannelToString(g_radio.GetChannel()), COL_WIDTH_CONFIG-1) << boldOff();
+    Serial << setForegroundColor(CYAN);
+    Serial << xy(x,y) << F("Frequency");
+    nextCol(x, y, COL_WIDTH_CONFIG, ROW_WIDTH);
+    Serial << xy(x,y) << rightAlignStr(g_radio.FrequencyHzToString(g_radio.GetFrequencyHz()), COL_WIDTH_CONFIG-1);
+    nextCol(x, y, COL_WIDTH_CONFIG, ROW_WIDTH);
 
     uint8_t baseId[10];
     size_t size = sizeof(baseId);
     if (g_radio.GetBaseId(baseId, size))
     {
-      Serial << xy(1+2*COL_WIDTH_CONFIG,ROW_CONFIG)   << F("BaseId");
-      Serial << xy(1+3*COL_WIDTH_CONFIG,ROW_CONFIG)   << boldOn() << rightAlignStr(g_radio.BaseIdToString(baseId, size), COL_WIDTH_CONFIG-1) << boldOff();
+      Serial << xy(x,y) << F("BaseId");
+      nextCol(x, y, COL_WIDTH_CONFIG, ROW_WIDTH);
+      Serial << xy(x,y) << rightAlignStr(g_radio.BaseIdToString(baseId, size), COL_WIDTH_CONFIG-1);
+      nextCol(x, y, COL_WIDTH_CONFIG, ROW_WIDTH);
     }
-    Serial << xy(1,ROW_CONFIG+1)                    << F("Datarate");
-    Serial << xy(1+COL_WIDTH_CONFIG,ROW_CONFIG+1)   << boldOn() << rightAlignStr(g_radio.DataRateToString(g_radio.GetDataRate()), COL_WIDTH_CONFIG-1) << boldOff();
-    Serial << xy(1+2*COL_WIDTH_CONFIG,ROW_CONFIG+1) << F("Pa-Level");
-    Serial << xy(1+3*COL_WIDTH_CONFIG,ROW_CONFIG+1) << boldOn() << rightAlignStr(g_radio.PowerLevelToString(g_radio.GetPowerLevel()), COL_WIDTH_CONFIG-1) << boldOff();
-    Serial << xy(1,ROW_CONFIG+2)                    << F("Retransmits");
-    Serial << xy(1+COL_WIDTH_CONFIG,ROW_CONFIG+2)   << boldOn() << rightAlignStr(g_radio.AutoRetransmitsToString(g_radio.GetAutoRetransmits()), COL_WIDTH_CONFIG-1) << boldOff();
-    Serial << xy(1+2*COL_WIDTH_CONFIG,ROW_CONFIG+2) << F("RetrDelay");
+    if (g_radio.CanSetDataRate())
+    {
+      Serial << xy(x,y) << F("Datarate");
+      nextCol(x, y, COL_WIDTH_CONFIG, ROW_WIDTH);
+      Serial << xy(x,y) << rightAlignStr(g_radio.DataRateToString(g_radio.GetDataRate()), COL_WIDTH_CONFIG-1) << boldOff();
+      nextCol(x, y, COL_WIDTH_CONFIG, ROW_WIDTH);
+    }
+    if (g_radio.CanSetPowerLevel())
+    {
+      Serial << xy(x,y) << F("PowerLevel");
+      nextCol(x, y, COL_WIDTH_CONFIG, ROW_WIDTH);
+      Serial << xy(x,y) << rightAlignStr(g_radio.PowerLevelToString(g_radio.GetPowerLevel()), COL_WIDTH_CONFIG-1) << boldOff();
+      nextCol(x, y, COL_WIDTH_CONFIG, ROW_WIDTH);
+    }
+    if (g_radio.CanSetAutoRetransmits())
+    {
+      Serial << xy(x,y) << F("Retransmits");
+      nextCol(x, y, COL_WIDTH_CONFIG, ROW_WIDTH);
+      Serial << xy(x,y) << rightAlignStr(g_radio.AutoRetransmitsToString(g_radio.GetAutoRetransmits()), COL_WIDTH_CONFIG-1) << boldOff();
+      nextCol(x, y, COL_WIDTH_CONFIG, ROW_WIDTH);
+    }
+    if (g_radio.CanSetAutoRetransmitDelay())
+    {
+      Serial << xy(x,y) << F("Retrans. delay");
+      nextCol(x, y, COL_WIDTH_CONFIG, ROW_WIDTH);
+      String s = g_radio.AutoRetransmitDelayToString(g_radio.GetAutoRetransmitDelay());
+      s += F("us");
+      Serial << xy(x,y) << rightAlignStr(s, COL_WIDTH_CONFIG-1);
+      nextCol(x, y, COL_WIDTH_CONFIG, ROW_WIDTH);
+    }
+    Serial << xy(x,y) << F("Payload size");
+    nextCol(x, y, COL_WIDTH_CONFIG, ROW_WIDTH);
+    Serial << xy(x,y) << rightAlignStr(String(g_payloadLen), COL_WIDTH_CONFIG-1) << boldOff();
+    nextCol(x, y, COL_WIDTH_CONFIG, ROW_WIDTH);
 
-    String strDelay = g_radio.AutoRetransmitDelayToString(g_radio.GetAutoRetransmitDelay());
-    strDelay += F("us");
-    Serial << xy(1+3*COL_WIDTH_CONFIG,ROW_CONFIG+2) << boldOn() << rightAlignStr(strDelay, COL_WIDTH_CONFIG-1) << boldOff() ;
-    Serial << xy(1,ROW_CONFIG+3)                    << F("Payload size");
-    Serial << xy(1+COL_WIDTH_CONFIG,ROW_CONFIG+3)   << boldOn() << rightAlignStr(String(g_payloadLen), COL_WIDTH_CONFIG-1) << boldOff();
+    {
+      Serial << xy(x,y) << F("Ping interval");
+      nextCol(x, y, COL_WIDTH_CONFIG, ROW_WIDTH);
+      String s = String(g_pingIntervalMs);
+      s += F("ms");
+      Serial << xy(x,y) << rightAlignStr(s, COL_WIDTH_CONFIG-1);
+    }
   }
 
   // RSSI histogram
   {
-    uint8_t x = WIDTH_HIST_RSSI_BUCKETS+1;
-    uint8_t y = ROW_HIST_RSSI;
+    x = WIDTH_HIST_RSSI_BUCKETS+1;
+    static uint8_t yHist = 0;
+    if (rebuild)
+    {
+      yHist = y + 2;
+    }
+    y = yHist;
     uint8_t w = WIDTH_HIST_RSSI;
     for (size_t b = 0; b < g_histRssi.size(); ++b)
     {
@@ -236,39 +333,45 @@ void screenUpdate(const bool rebuild)
       {
         int16_t db = g_histRssi.lowerbound(b) + (g_histRssi.upperbound(b) - g_histRssi.lowerbound(b)) / 2;
 
-        Serial << defaultBackground() << setForegroundColor(YELLOW);
-        Serial << xy(1,y);
+        String label;
         if (b == 0)
         {
           // Special case: Failed transmissions are stored in bucket 0
-          Serial << boldOn() << F("Failed") << boldOff();
+          label = F("Failed");
         }
         else
         {
-          Serial << db << F(" dB");
+          label = String(db);
+          label += F(" dB");
         }
+        Serial << xy(1,y) << defaultBackground() << setForegroundColor(YELLOW) << rightAlignStr(label, WIDTH_HIST_RSSI_BUCKETS-1);
       }
       Serial << setBackgroundColor(YELLOW);
       Serial << fill(x,  y, x+xc-1, y, ' ');
       Serial << defaultBackground() << setForegroundColor(YELLOW);
       Serial << fill(x+xc, y, x+w-1,  y, '-');
 
-      Serial << xy(WIDTH_HIST_RSSI_BUCKETS+WIDTH_HIST_RSSI+1+1,y) << boldOn() << rightAlignStr(String(g_histRssi.count(b)), WIDTH_HIST_RSSI_COUNTS) << boldOff();
+      Serial << xy(WIDTH_HIST_RSSI_BUCKETS+WIDTH_HIST_RSSI,y) << rightAlignStr(String(g_histRssi.count(b)), WIDTH_HIST_RSSI_COUNTS) << boldOff();
       ++y;
     }
     // SLowly decrease bucket values, to limit history time
     g_histRssi.decay(g_histogramDecayRate);
   }
 
+  static uint8_t yTxRxHist = 0;
+  if (rebuild)
+  {
+    yTxRxHist = y + 1;
+  }
   // Tx Ok/Fail histogram
   {
     uint8_t x = WIDTH_HIST_TXOK_BUCKETS+1;
-    uint8_t y = ROW_HIST_TXOK;
+    y = yTxRxHist;
     uint8_t w = WIDTH_HIST_TXOK;  
     if (rebuild)
     {
       Serial << defaultBackground() << setForegroundColor(YELLOW);
-      Serial << xy(1,y) << F("Tx ") << setForegroundColor(GREEN) << F("Ok") << setForegroundColor(YELLOW) << '/' <<  setForegroundColor(RED) << F("Fail");
+      Serial << xy(1,y) << F("Tx ") << setForegroundColor(GREEN) << F("Ok");
       Serial << defaultForeground();
     }
     double relOk = g_histTxOk.relcount(1);
@@ -282,7 +385,7 @@ void screenUpdate(const bool rebuild)
     String ratio = String(perc);
     ratio += ' ';
     ratio += '%';
-    Serial << xy(WIDTH_HIST_TXOK_BUCKETS+WIDTH_HIST_TXOK+1+1,y) << boldOn() << setForegroundColor(GREEN) << rightAlignStr(ratio, WIDTH_HIST_TXOK_COUNTS) << boldOff();
+    Serial << xy(WIDTH_HIST_TXOK_BUCKETS+WIDTH_HIST_TXOK,y) << setForegroundColor(GREEN) << rightAlignStr(ratio, WIDTH_HIST_TXOK_COUNTS) << boldOff();
     Serial << defaultForeground();
     // SLowly decrease bucket values, to limit history time
     g_histTxOk.decay(g_histogramDecayRate);
@@ -291,13 +394,13 @@ void screenUpdate(const bool rebuild)
 #ifdef MASTER
   // Rx Ok/Fail histogram
   {
-    uint8_t x = WIDTH_HIST_RXOK_BUCKETS+1;
-    uint8_t y = ROW_HIST_RXOK;
+    x = WIDTH_HIST_RXOK_BUCKETS+1;
+    y = yTxRxHist + 1;
     uint8_t w = WIDTH_HIST_RXOK;  
     if (rebuild)
     {
       Serial << defaultBackground() << setForegroundColor(YELLOW);
-      Serial << xy(1,y) << F("TxRx ") << setForegroundColor(GREEN) << F("Ok") << setForegroundColor(YELLOW) << '/' <<  setForegroundColor(RED) << F("Fail");
+      Serial << xy(1,y) << F("TxRx ") << setForegroundColor(GREEN) << F("Ok");
       Serial << defaultForeground();
     }
     double relOk = g_histTxRxOk.relcount(1);
@@ -311,7 +414,7 @@ void screenUpdate(const bool rebuild)
     String ratio = String(perc);
     ratio += ' ';
     ratio += '%';
-    Serial << xy(WIDTH_HIST_RXOK_BUCKETS+WIDTH_HIST_RXOK+1+1,y) << boldOn() << setForegroundColor(GREEN) << rightAlignStr(ratio, WIDTH_HIST_RXOK_COUNTS) << boldOff();
+    Serial << xy(WIDTH_HIST_RXOK_BUCKETS+WIDTH_HIST_RXOK,y) << setForegroundColor(GREEN) << rightAlignStr(ratio, WIDTH_HIST_RXOK_COUNTS) << boldOff();
     Serial << defaultForeground();
     // SLowly decrease bucket values, to limit history time
     g_histTxRxOk.decay(g_histogramDecayRate);
@@ -321,20 +424,50 @@ void screenUpdate(const bool rebuild)
   // Menu
   if (rebuild)
   {
-    Serial << setForegroundColor(BLUE);
+    x = 1;
+    y += 2;
+    Serial << setForegroundColor(CYAN);
 #ifdef MASTER
-    Serial << xy(1,ROW_MENU)                  << F("cn - Set channel [") << int(g_radio.GetChannelMin()) << F("..") << int(g_radio.GetChannelMax()) << ']';
-    Serial << xy(1+COL_WIDTH_MENU,ROW_MENU)   << F("rn - Set datarate [") << int(g_radio.GetDataRateMin()) << F("..") << int(g_radio.GetDataRateMax()) << ']';
-    Serial << xy(1,ROW_MENU+1)                << F("pn - Set PaLevel [") << int(g_radio.GetPowerLevelMin()) << F("..") << int(g_radio.GetPowerLevelMax()) << ']';
-    Serial << xy(1+COL_WIDTH_MENU,ROW_MENU+1) << F("tn - Set retransmits [") << int(g_radio.GetAutoRetransmitsMin()) << F("..") << int(g_radio.GetAutoRetransmitsMax()) << ']';
-    Serial << xy(1,ROW_MENU+2)                << F("yn - Set retr. delay [") << int(g_radio.GetAutoRetransmitDelayMin()) << F("..") << int(g_radio.GetAutoRetransmitDelayMax()) << ']';
-    Serial << xy(1,ROW_MENU+3)                << F("ln - Set payload len [1..") << MAX_PAYLOAD << ']';
-    Serial << xy(1+COL_WIDTH_MENU,ROW_MENU+3) << F("x - Reset settings");
+    Serial << xy(x,y) << boldOn() << F("Menu") << boldOff();
+    ++y;
+    if (g_radio.CanSetFrequencyHz())
+    {
+      Serial << xy(x,y) << F("fn - Frequency [") << int(g_radio.GetFrequencyMinHz()/freqDisplayStep) << F("..") << int(g_radio.GetFrequencyMaxHz()/freqDisplayStep) << ']';
+      nextCol(x, y, COL_WIDTH_MENU, ROW_WIDTH);
+    }
+    if (g_radio.CanSetDataRate())
+    {
+      Serial << xy(x,y) << F("rn - Datarate [") << int(g_radio.GetDataRateMin()) << F("..") << int(g_radio.GetDataRateMax()) << ']';
+      nextCol(x, y, COL_WIDTH_MENU, ROW_WIDTH);
+    }
+    if (g_radio.CanSetPowerLevel())
+    {
+      Serial << xy(x,y) << F("pn - PowerLevel [") << int(g_radio.GetPowerLevelMin()) << F("..") << int(g_radio.GetPowerLevelMax()) << ']';
+      nextCol(x, y, COL_WIDTH_MENU, ROW_WIDTH);
+    }
+    if (g_radio.CanSetAutoRetransmits())
+    {
+      Serial << xy(x,y) << F("tn - Retransmits [") << int(g_radio.GetAutoRetransmitsMin()) << F("..") << int(g_radio.GetAutoRetransmitsMax()) << ']';
+      nextCol(x, y, COL_WIDTH_MENU, ROW_WIDTH);
+    }
+    if (g_radio.CanSetAutoRetransmitDelay())
+    {
+      Serial << xy(x,y) << F("yn - Retrans. delay [") << int(g_radio.GetAutoRetransmitDelayMin()) << F("..") << int(g_radio.GetAutoRetransmitDelayMax()) << ']';
+      nextCol(x, y, COL_WIDTH_MENU, ROW_WIDTH);
+    }
+    Serial << xy(x,y) << F("ln - Payload size [1..") << MAX_PAYLOAD << ']';
+    nextCol(x, y, COL_WIDTH_MENU, ROW_WIDTH);
+    Serial << xy(x,y) << F("in - Ping interval [") << MIN_PING_INTERVAL_MS << F("..") << MAX_PING_INTERVAL_MS << ']';
+    nextCol(x, y, COL_WIDTH_MENU, ROW_WIDTH);
+    Serial << xy(x,y) << F("x  - Reset settings");
+    nextCol(x, y, COL_WIDTH_MENU, ROW_WIDTH);
 #endif
-    Serial << xy(1,ROW_MENU+4)                << F("0 - Reset statistics");
-    Serial << xy(1+COL_WIDTH_MENU,ROW_MENU+4) << F("dn - Set hist. decay [0..5]");
+    Serial << xy(x,y) << F("0  - Reset statistics");
+    nextCol(x, y, COL_WIDTH_MENU, ROW_WIDTH);
+    Serial << xy(x,y) << F("dn - Histogram decay [0..5]");
   }
   Serial << home();
+#endif // ifndef MY_DEBUG
 }
 
 #pragma GCC diagnostic push
@@ -344,7 +477,7 @@ bool processCommand(t_command& cmd)
   bool configChanged = false;
   if (cmd.m_complete)
   {
-    uint8_t value = uint8_t(cmd.m_text.substring(1, cmd.m_text.length()).toInt());
+    int32_t value = cmd.m_text.substring(1, cmd.m_text.length()).toInt();
     if (cmd.m_text.startsWith(F("0")))
     {
       g_histRssi.clear();
@@ -364,11 +497,12 @@ bool processCommand(t_command& cmd)
       g_radio.SetConfigDefault();
       configChanged = true;
     }
-    else if (cmd.m_text.startsWith(F("c")))
+    else if (cmd.m_text.startsWith(F("f")))
     {
-      if ((value >= g_radio.GetChannelMin()) and (value <= g_radio.GetChannelMax()))
+      const uint32_t freqHz = uint32_t(value) * freqDisplayStep;
+      if ((freqHz >= g_radio.GetFrequencyMinHz()) and (freqHz <= g_radio.GetFrequencyMaxHz()))
       {
-        configChanged = g_radio.SetChannel(value);
+        configChanged = g_radio.SetFrequencyHz(freqHz);
       }
     }
     else if (cmd.m_text.startsWith(F("r")))
@@ -406,6 +540,13 @@ bool processCommand(t_command& cmd)
         g_payloadLen = value;
       }
     }
+    else if (cmd.m_text.startsWith(F("i")))
+    {
+      if ((value >= MIN_PING_INTERVAL_MS) && (value <= MAX_PING_INTERVAL_MS))
+      {
+        g_pingIntervalMs = value;
+      }
+    }
 #endif
     cmd.clear();
     screenUpdate(true);
@@ -418,9 +559,11 @@ void serialEvent()
 {
   while(Serial.available())
   {
-    char c = static_cast<char>(Serial.read());
-    if (c == '\n') cmd.m_complete = true;
-    else           cmd.m_text += c;
+    const char c = static_cast<char>(Serial.read());
+    if (c == '\r')
+      g_serialCommand.m_complete = true;
+    else if ((c >= 32 ) and (c < 127))
+      g_serialCommand.m_text += c;
   }
 }
 
@@ -442,7 +585,7 @@ void receivedPing(const unsigned long rxTsUs, const t_pingPongData& data)
   g_txData.clear();
   g_txData.m_txTsUs = micros();
   g_txData.m_txOk   = send(g_txMsgPingPong);
-  g_txData.m_rssi   = transportGetSendingRSSI();
+  g_txData.m_rssi   = g_radio.GetRssi();
   logResults(g_txData);
 }
 
@@ -459,7 +602,7 @@ void sendPing(t_txData& data)
   data.m_data   = pingPongData;
   data.m_txTsUs = micros();
   data.m_txOk   = send(g_txMsgPingPong);
-  data.m_rssi   = transportGetSendingRSSI();
+  data.m_rssi   = g_radio.GetRssi();
   first = false;
 }
 
@@ -504,26 +647,20 @@ void receive(const MyMessage &rxMsg)
     receivedPong(rxTsUs, data);
 #else
     size_t len = mGetLength(rxMsg);
-    bool screenRefresh = len != g_payloadLen;
+    const bool payloadLengthChanged = len != g_payloadLen;
     g_payloadLen = len;
     receivedPing(rxTsUs, data);
-    if (screenRefresh)
+    if (payloadLengthChanged)
     {
       screenUpdate(true);
     }
 #endif
 
-    static uint8_t count = 0;
-    if (count % SCREEN_UPDATE_COUNT == 0)
-    {
-      screenUpdate(false);
-    }
-    ++count;
+//    screenUpdate(false);
   }
   else if ((CHILD_ID_CONFIG == rxMsg.sensor) && (V_VAR1 == rxMsg.type))
   {
     // New radio config received
-
     if (g_radio.ConfigDeserialize(const_cast<const uint8_t*>(static_cast<uint8_t*>(rxMsg.getCustom())), mGetLength(rxMsg)))
     {
       screenUpdate(true);
@@ -538,34 +675,25 @@ void loop()
 #ifdef MASTER
   static unsigned long prevMs = millis();
   const unsigned long nowMs = millis();
-  static uint8_t count = 0;
-  if ((nowMs - prevMs) >= PING_INTERVAL_MS)
+  if ((nowMs - prevMs) >= g_pingIntervalMs)
   {
-    if (count % SCREEN_UPDATE_COUNT == 0)
+    static bool first = true;
+    if (first)
     {
-      screenUpdate(false);
+      prevMs = nowMs;
+      first = false;
     }
     else
     {
-      static bool first = true;
-      if (first)
-      {
-        prevMs = nowMs;
-        first = false;
-      }
-      else
-      {
-        prevMs = prevMs + PING_INTERVAL_MS;
-        // Ping-pong has been performed. Log the results.
-        logResults(g_txData);
-      }
-      // Initiate next ping-pong
-      sendPing(g_txData);
+      prevMs = prevMs + g_pingIntervalMs;
+      // Ping-pong has been performed. Log the results.
+      logResults(g_txData);
     }
-    ++count;
+    // Initiate next ping-pong
+    sendPing(g_txData);
   }
 
-  if (processCommand(cmd))
+  if (processCommand(g_serialCommand))
   {
     // Config changed. Send new config to parent and activate it.
     bool configSentOk = sendConfig();
@@ -586,6 +714,8 @@ void loop()
 
 #ifdef SLAVE
   // Slave can only clear/change statistics, not radio settings.
-  (void)processCommand(cmd);
+  (void)processCommand(g_serialCommand);
 #endif
+
+  screenUpdate(false);
 }

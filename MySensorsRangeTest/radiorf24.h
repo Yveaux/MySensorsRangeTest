@@ -12,6 +12,8 @@ public:
   bool ConfigSerialize(uint8_t * out, size_t& size) override;
   bool ConfigDeserialize(const uint8_t * in, const size_t size) override;
 
+  bool SanityCheck() override { return RF24_sanityCheck(); }
+
   bool GetBaseId(uint8_t * out, size_t& size) override;
   String BaseIdToString(const uint8_t * baseId, const size_t size) override;
 
@@ -20,11 +22,11 @@ public:
   int16_t GetRssiMax() override  { return -29; };
   int16_t GetRssiStep() override { return 8; };
 
-  bool    SetChannel(const uint8_t channel) override;
-  uint8_t GetChannel() override     { return m_radioConfig.m_channel; };
-  uint8_t GetChannelMin() override  { return 0u; };
-  uint8_t GetChannelMax() override  { return 125u; };
-  uint8_t GetChannelStep() override { return 1u; };
+  bool     SetFrequencyHz(const uint32_t frequency) override;
+  uint32_t GetFrequencyHz()     { return GetFrequencyMinHz() + m_radioConfig.m_channel * GetFrequencyStepHz(); };
+  uint32_t GetFrequencyMinHz()  { return 2400000000ul; };    // 2400 [MHz]
+  uint32_t GetFrequencyMaxHz()  { return 2525000000ul; };    // 2525 [MHz]
+  uint32_t GetFrequencyStepHz() { return 1000000ul; };       // 1    [MHz]
 
   bool    SetDataRate(const uint8_t rate) override;
   uint8_t GetDataRate() override      { return m_radioConfig.m_dataRate; };
@@ -33,14 +35,14 @@ public:
   uint8_t GetDataRateStep() override  { return 1u; };
   String DataRateToString(const uint8_t rate) override;
 
-  bool    SetPowerLevel(const uint8_t level) override;
-  uint8_t GetPowerLevel() override     { return m_radioConfig.m_paLevel; };
-  uint8_t GetPowerLevelMin() override  { return 0u; };
-  uint8_t GetPowerLevelMax() override  { return 3u; };
-  uint8_t GetPowerLevelStep() override { return 1u; };
-  String PowerLevelToString(const uint8_t level) override;
+  bool   SetPowerLevel(const int8_t level) override;
+  int8_t GetPowerLevel() override     { return m_radioConfig.m_paLevel; };
+  int8_t GetPowerLevelMin() override  { return 0; };
+  int8_t GetPowerLevelMax() override  { return 3; };
+  int8_t GetPowerLevelStep() override { return 1; };
+  String PowerLevelToString(const int8_t level) override;
 
-  bool   SetAutoRetransmits(const uint8_t retransmits) override;
+  bool    SetAutoRetransmits(const uint8_t retransmits) override;
   uint8_t GetAutoRetransmits() override      { return m_radioConfig.m_retransmits; };
   uint8_t GetAutoRetransmitsMin() override   { return 0u; };
   uint8_t GetAutoRetransmitsMax() override   { return 15u; };
@@ -49,19 +51,19 @@ public:
   bool    SetAutoRetransmitDelay(const uint8_t delay) override;
   uint8_t GetAutoRetransmitDelay() override     { return m_radioConfig.m_retransmitDelay; };
   uint8_t GetAutoRetransmitDelayMin() override  { return 0u; };
-  uint8_t GetAutoRetransmitDelayMax() override  { return 1u; };
-  uint8_t GetAutoRetransmitDelayStep() override { return 15u; };
-  String AutoRetransmitDelayToString(const uint8_t delay) override;
+  uint8_t GetAutoRetransmitDelayMax() override  { return 15u; };
+  uint8_t GetAutoRetransmitDelayStep() override { return 1u; };
+  String  AutoRetransmitDelayToString(const uint8_t delay) override;
 
 protected:
   // Radio config, exchanged between master & slave
 #pragma pack(push, 1)
   struct {
-    uint8_t m_channel;
-    uint8_t m_dataRate;
-    uint8_t m_paLevel;
-    uint8_t m_retransmits;
-    uint8_t m_retransmitDelay;
+    uint8_t  m_channel;
+    uint8_t  m_dataRate;
+    int8_t   m_paLevel;
+    uint8_t  m_retransmits;
+    uint8_t  m_retransmitDelay;
   } m_radioConfig;
 #pragma pack(pop)
 
@@ -143,9 +145,14 @@ int16_t RadioRF24::GetRssi()
   return RF24_getSendingRSSI();
 }
 
-bool RadioRF24::SetChannel(const uint8_t channel)
+bool RadioRF24::SetFrequencyHz(const uint32_t frequency)
 {
-  m_radioConfig.m_channel = channel;
+  const auto offs = frequency - GetFrequencyMinHz();
+  if (    (frequency < GetFrequencyMinHz())
+       or (frequency > GetFrequencyMaxHz()) )
+    return false;
+
+  m_radioConfig.m_channel = offs / GetFrequencyStepHz();    // Round to nearest channel
   return true; 
 }
 
@@ -155,7 +162,7 @@ bool RadioRF24::SetDataRate(const uint8_t rate)
   return true; 
 }
 
-bool RadioRF24::SetPowerLevel(const uint8_t level)
+bool RadioRF24::SetPowerLevel(const int8_t level)
 {
   m_radioConfig.m_paLevel = level;
   return true; 
@@ -214,7 +221,7 @@ String RadioRF24::DataRateToString(const uint8_t rate)
   return F("Unknown");
 }
 
-String RadioRF24::PowerLevelToString(const uint8_t level)
+String RadioRF24::PowerLevelToString(const int8_t level)
 {
   switch(level)
   {

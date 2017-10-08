@@ -20,3 +20,21 @@ template <typename T> static String ToHexStr(T val, const size_t numDigits = 0)
   }
   return s;
 }
+
+
+static String rightAlignStr(const String& str, const size_t width, const char fill = ' ')
+{
+  if (str.length() >= width)
+  {
+    return str.substring(str.length() - width);
+  }
+
+  String s;
+  size_t i = width - str.length();
+  do
+  {
+    s += fill;
+  } while (--i != 0);
+  s += str;
+  return s;
+}
