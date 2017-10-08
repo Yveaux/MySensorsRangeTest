@@ -159,6 +159,7 @@ static size_t  g_payloadLen = PAYLOAD_LENGTH_MIN;      // Length of ping-pong pa
 // First bucket in histogram is used to store transmitssion failures.
 // This looks most intuitive as the results will be displayed next to the lowest RSSI.
 static histogram<int16_t> g_histRssi;
+static int16_t g_histFailedRssiValue;   // Value to write to histogram for failed transmits
 // Histogram to track succes/fail ratio for transmissions.
 static histogram<uint8_t> g_histTxOk(2, 0, 2);
 // Histogram to track succes/fail ratio for reception (complete ping-pong cycle).
@@ -193,7 +194,7 @@ void before()
   g_histRssi.resize( numBuckets,
                      rssiMin - rssiStep / 2 - rssiStep /*failure bucket*/,
                      rssiMax + rssiStep / 2 + 1 /*+1 for rounding*/);
-
+  g_histFailedRssiValue = rssiMin - rssiStep / 2 - rssiStep;
   screenUpdate(true);
 }
 
@@ -315,15 +316,17 @@ void screenUpdate(const bool rebuild)
     }
   }
 
+  // Store y position of histogram. This is needed when redrawing only the histogram.
+  static uint8_t yHist = 0;
+  if (rebuild)
+  {
+    yHist = y + 2;
+  }
+  y = yHist;
+
   // RSSI histogram
   {
     x = WIDTH_HIST_RSSI_BUCKETS+1;
-    static uint8_t yHist = 0;
-    if (rebuild)
-    {
-      yHist = y + 2;
-    }
-    y = yHist;
     uint8_t w = WIDTH_HIST_RSSI;
     for (size_t b = 0; b < g_histRssi.size(); ++b)
     {
@@ -358,15 +361,10 @@ void screenUpdate(const bool rebuild)
     g_histRssi.decay(g_histogramDecayRate);
   }
 
-  static uint8_t yTxRxHist = 0;
-  if (rebuild)
-  {
-    yTxRxHist = y + 1;
-  }
   // Tx Ok/Fail histogram
   {
-    uint8_t x = WIDTH_HIST_TXOK_BUCKETS+1;
-    y = yTxRxHist;
+    x = WIDTH_HIST_TXOK_BUCKETS+1;
+    ++y;
     uint8_t w = WIDTH_HIST_TXOK;  
     if (rebuild)
     {
@@ -395,7 +393,7 @@ void screenUpdate(const bool rebuild)
   // Rx Ok/Fail histogram
   {
     x = WIDTH_HIST_RXOK_BUCKETS+1;
-    y = yTxRxHist + 1;
+    ++y;
     uint8_t w = WIDTH_HIST_RXOK;  
     if (rebuild)
     {
@@ -572,7 +570,7 @@ void logResults(const t_txData& data)
   g_histTxOk.store(data.m_txOk ? 1 : 0);
   g_histTxRxOk.store(data.m_rxOk ? 1 : 0);
   // If Tx failed: Store in RSSI for first bucket
-  g_histRssi.store(data.m_txOk ? data.m_rssi : (g_radio.GetRssiMin() - g_radio.GetRssiStep()));
+  g_histRssi.store(data.m_txOk ? data.m_rssi : g_histFailedRssiValue);
 }
 
 // Slave: receive ping, send pong
